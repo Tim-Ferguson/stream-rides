@@ -1,0 +1,51 @@
+.DS_Store
+
+# Local toolchains downloaded for this workspace. Keep reproducible Aurora
+# compatibility sources while ignoring SDK/JDK downloads and build trees.
+tools/*
+!tools/aurora-store/
+!tools/aurora-store/**
+!tools/aurora-profiles/
+!tools/aurora-profiles/**
+!tools/termux/
+!tools/termux/**
+!tools/security/
+!tools/security/**
+!tools/tests/
+!tools/tests/**
+!tools/verify-release.sh
+!tools/audit-public-tree.sh
+!tools/export-public-snapshot.sh
+!tools/install-gitleaks.sh
+!tools/public-binary-manifest.tsv
+!tools/validate-png.pl
+
+# Local state and captured diagnostics.
+.private/
+device-setup/.state/
+device-setup/*.png
+device-setup/ride-starter/*.png
+device-setup/*.xml
+
+# Historical local reverse-engineering inputs and owner captures. All screenshots
+# stay private and are excluded independently by the public exporter and audit.
+device-setup/Check * Overlay.command
+device-setup/Dismiss * Banner.command
+device-setup/Reset * Apps.command
+device-setup/???????-control
+device-setup/???????-dex/
+screenshots/
+
+# Downloaded or extracted third-party app packages.
+device-setup/apks/
+device-setup/*.apk
+device-setup/*.xapk
+device-setup/*.zip
+device-setup/*.tar.gz
+device-setup/vendor-dex/
+local-backups/
+
+# Generated Android build outputs and signing artifacts.
+device-setup/ride-starter/build/
+device-setup/window-agent/build/
+*.idsig

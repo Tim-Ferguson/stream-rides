@@ -1,0 +1,70 @@
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index c1f8231..e8e1e3b 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -111,6 +111,19 @@ configure<ApplicationExtension> {
+             )
+             if (File("signing.properties").exists()) {
+                 signingConfig = signingConfigs.getByName("release")
++            } else if (providers.gradleProperty("saroAllowPublicTestKey").orNull == "true") {
++                signingConfig = signingConfigs.getByName("aosp")
++                applicationIdSuffix = ".saro.unsafe"
++                versionNameSuffix = "-UNSAFE-TEST-KEY"
++                resValue("string", "app_name", "Aurora Store (UNSAFE)")
++            } else if (gradle.startParameter.taskNames.any {
++                    it.contains("release", ignoreCase = true)
++                }) {
++                throw GradleException(
++                    "Private signing.properties is required at the Aurora checkout root. " +
++                        "The public test key is available only with " +
++                        "-PsaroAllowPublicTestKey=true and a distinct application ID."
++                )
+             }
+         }
+
+diff --git a/app/src/main/java/com/aurora/store/compose/composable/StreamCarousel.kt b/app/src/main/java/com/aurora/store/compose/composable/StreamCarousel.kt
+index e77618b..1ef9d73 100644
+--- a/app/src/main/java/com/aurora/store/compose/composable/StreamCarousel.kt
++++ b/app/src/main/java/com/aurora/store/compose/composable/StreamCarousel.kt
+@@ -160,7 +160,7 @@ internal fun ClusterRow(
+     ) {
+         itemsIndexed(
+             items = cluster.clusterAppList,
+-            key = { _, app -> app.packageName }
++            key = { index, app -> "${app.packageName}#$index" }
+         ) { _, app ->
+             AppListItem(
+                 app = app,
+diff --git a/app/src/main/java/com/aurora/store/compose/ui/spoof/DevicePage.kt b/app/src/main/java/com/aurora/store/compose/ui/spoof/DevicePage.kt
+index fc6c4a8..b6963e3 100644
+--- a/app/src/main/java/com/aurora/store/compose/ui/spoof/DevicePage.kt
++++ b/app/src/main/java/com/aurora/store/compose/ui/spoof/DevicePage.kt
+@@ -82,7 +82,12 @@ private fun PageContent(
+             }
+         }
+
+-        items(items = devices, key = { device -> device.getProperty("Build.PRODUCT") }) { device ->
++        items(
++            items = devices,
++            key = { device ->
++                "${device.getProperty("Build.PRODUCT")}#${device.getProperty("Platforms")}"
++            }
++        ) { device ->
+             DeviceListItem(
+                 userReadableName = device.getProperty("UserReadableName"),
+                 manufacturer = device.getProperty("Build.MANUFACTURER"),
+diff --git a/app/src/main/java/com/aurora/store/data/providers/SpoofDeviceProvider.kt b/app/src/main/java/com/aurora/store/data/providers/SpoofDeviceProvider.kt
+index 17fc4c3..3a2c18a 100644
+--- a/app/src/main/java/com/aurora/store/data/providers/SpoofDeviceProvider.kt
++++ b/app/src/main/java/com/aurora/store/data/providers/SpoofDeviceProvider.kt
+@@ -51,7 +51,9 @@ open class SpoofDeviceProvider(private val context: Context) {
+             propertiesList.addAll(spoofDevicesFromApk)
+             propertiesList.addAll(spoofDevicesFromUser)
+             propertiesList.sortBy { it.getProperty("UserReadableName") }
+-            return propertiesList.distinctBy { it.getProperty("Build.PRODUCT") }
++            return propertiesList.distinctBy {
++                it.getProperty("Build.PRODUCT") to it.getProperty("Platforms")
++            }
+         }
+
+     private val spoofDevicesFromApk: List<Properties>

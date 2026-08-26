@@ -1,0 +1,8 @@
+<resources>
+    <string name="app_name">SARO</string>
+    <string name="overlay_app_name">Start SARO Ride</string>
+    <string name="service_name">SARO Ride Overlay</string>
+    <string name="service_description">Shows live bike metrics and ride controls, and optionally dismisses the subscription prompt in the original bike app.</string>
+    <string name="tv_remote_service_name">SARO TV Remote</string>
+    <string name="tv_remote_service_description">Optional touchscreen D-pad for compatible Android TV app builds.</string>
+</resources>

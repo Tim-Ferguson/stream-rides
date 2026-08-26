@@ -1,0 +1,3430 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ -z "${ADB:-}" ]]; then
+  if command -v adb >/dev/null 2>&1; then
+    ADB="$(command -v adb)"
+  elif [[ -x /opt/homebrew/bin/adb ]]; then
+    ADB="/opt/homebrew/bin/adb"
+  else
+    ADB="adb"
+  fi
+fi
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+STATE_DIR="${SARO_CONTROL_STATE_DIR:-${PELOTON_CONTROL_STATE_DIR:-$SCRIPT_DIR/.state}}"
+LAST_CONTENT_FILE="$STATE_DIR/last-content"
+HELPER_PACKAGE="com.pelotonhack.ridestarter"
+HELPER_COMPONENT="$HELPER_PACKAGE/.MainActivity"
+HELPER_ACCESSIBILITY="$HELPER_PACKAGE/$HELPER_PACKAGE.RideStarterAccessibilityService"
+HELPER_TV_ACCESSIBILITY="$HELPER_PACKAGE/$HELPER_PACKAGE.TvRemoteAccessibilityService"
+CONFIG_REMOTE="/sdcard/Android/data/$HELPER_PACKAGE/files/saro-setup.json"
+CONFIG_STATUS_REMOTE="/sdcard/Android/data/$HELPER_PACKAGE/files/saro-setup.status"
+LEGACY_CONFIG_REMOTE="/sdcard/Android/data/$HELPER_PACKAGE/files/peloton-setup.json"
+LEGACY_CONFIG_STATUS_REMOTE="/sdcard/Android/data/$HELPER_PACKAGE/files/peloton-setup.status"
+APK_AUDIT_TOOL="${APK_AUDIT_TOOL:-$SCRIPT_DIR/../tools/security/audit-apks.sh}"
+DEVICE_SELECTED=0
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  saro-control status
+  saro-control just-ride
+  saro-control browser [url]
+  saro-control youtube
+  saro-control split-browser [url]
+  saro-control split-youtube
+  saro-control overlay-browser [url]
+  saro-control overlay-youtube
+  saro-control netflix
+  saro-control split-netflix
+  saro-control overlay-netflix
+  saro-control disney
+  saro-control split-disney
+  saro-control overlay-disney
+  saro-control max
+  saro-control split-max
+  saro-control overlay-max
+  saro-control hbo
+  saro-control split-hbo
+  saro-control overlay-hbo
+  saro-control hulu
+  saro-control split-hulu
+  saro-control overlay-hulu
+  saro-control apple-tv
+  saro-control split-apple-tv
+  saro-control overlay-apple-tv
+  saro-control overlay-current
+  saro-control ride-controls
+  saro-control restore-overlay
+  saro-control dismiss-banner
+  saro-control research-start-window-agent --acknowledge-shell-risk
+  saro-control window-agent-status
+  saro-control stop-window-agent
+  saro-control deploy-helper
+  saro-control bootstrap-tablet
+  saro-control capture-original-state <directory>
+  saro-control verify-original-state <directory>
+  saro-control record-home-rollback
+  saro-control restore-home
+  saro-control safe-uninstall
+  saro-control export-config [path]
+  saro-control import-config <path>
+  saro-control backup [directory] [--with-apks]
+  saro-control verify-backup <directory>
+  saro-control audit-live <directory>
+  saro-control restore-backup <directory> [--allow-device-mismatch]
+  saro-control close-overlay
+  saro-control reset-apps
+  saro-control check
+  saro-control login-netflix
+  saro-control login-disney
+  saro-control login-max
+  saro-control login-hbo
+  saro-control login-hulu
+  saro-control login-apple-tv
+  saro-control screenshot
+
+Examples:
+  saro-control just-ride
+  saro-control split-youtube
+  saro-control overlay-youtube
+  saro-control split-netflix
+  saro-control overlay-netflix
+  saro-control ride-controls
+  saro-control restore-overlay
+  saro-control close-overlay
+  saro-control capture-original-state "$HOME/SARO-Backups/prechange-baseline"
+  saro-control bootstrap-tablet
+  saro-control login-netflix
+  saro-control split-disney
+  saro-control split-max
+  saro-control split-hulu
+  saro-control split-apple-tv
+  saro-control browser https://www.google.com
+USAGE
+}
+
+require_adb() {
+  if [[ "$ADB" == */* ]]; then
+    if [[ ! -x "$ADB" ]]; then
+      echo "ADB not found or not executable at $ADB" >&2
+      exit 1
+    fi
+  elif ! command -v "$ADB" >/dev/null 2>&1; then
+    echo "ADB not found on PATH: $ADB" >&2
+    exit 1
+  fi
+}
+
+adb_server_cmd() {
+  "$ADB" "$@"
+}
+
+adb_cmd() {
+  if [[ -n "${ANDROID_SERIAL:-}" ]]; then
+    "$ADB" -s "$ANDROID_SERIAL" "$@"
+  else
+    "$ADB" "$@"
+  fi
+}
+
+require_device() {
+  require_adb
+  if [[ "$DEVICE_SELECTED" == "1" ]]; then
+    return 0
+  fi
+
+  local devices_file selected count state
+  devices_file="$(mktemp "${TMPDIR:-/tmp}/saro-adb-devices.XXXXXX")"
+  if ! adb_server_cmd devices -l >"$devices_file"; then
+    rm -f "$devices_file"
+    echo "Could not query ADB devices." >&2
+    exit 1
+  fi
+
+  if [[ -n "${ANDROID_SERIAL:-}" ]]; then
+    selected="$(awk -v serial="$ANDROID_SERIAL" '$1 == serial {print $1 "\t" $2; exit}' "$devices_file")"
+    state="${selected#*$'\t'}"
+    if [[ -z "$selected" || "$state" != "device" ]]; then
+      echo "ANDROID_SERIAL '$ANDROID_SERIAL' is not connected in device state." >&2
+      cat "$devices_file" >&2
+      rm -f "$devices_file"
+      exit 1
+    fi
+  else
+    count="$(awk 'NR > 1 && $2 == "device" {count++} END {print count + 0}' "$devices_file")"
+    if [[ "$count" != "1" ]]; then
+      echo "Expected exactly one connected ADB device; found $count. Set ANDROID_SERIAL to select one explicitly." >&2
+      cat "$devices_file" >&2
+      rm -f "$devices_file"
+      exit 1
+    fi
+    ANDROID_SERIAL="$(awk 'NR > 1 && $2 == "device" {print $1; exit}' "$devices_file")"
+    export ANDROID_SERIAL
+  fi
+  if [[ ! "$ANDROID_SERIAL" =~ ^[A-Za-z0-9._:-]+$ ]]; then
+    echo "Refusing unsafe ADB serial value: $ANDROID_SERIAL" >&2
+    rm -f "$devices_file"
+    exit 1
+  fi
+  rm -f "$devices_file"
+
+  state="$(adb_cmd get-state 2>/dev/null || true)"
+  if [[ "$state" != "device" ]]; then
+    echo "Selected device '$ANDROID_SERIAL' is not available to ADB." >&2
+    adb_server_cmd devices -l >&2 || true
+    exit 1
+  fi
+  DEVICE_SELECTED=1
+}
+
+adb_shell() {
+  adb_cmd shell "$@"
+}
+
+sha256_file() {
+  local path="$1"
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$path" | awk '{print $1}'
+    return
+  fi
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$path" | awk '{print $1}'
+    return
+  fi
+  echo "A SHA-256 tool is required (shasum or sha256sum)." >&2
+  return 1
+}
+
+enable_window_overrides() {
+  adb_shell settings put global force_resizable_activities 1
+  adb_shell settings put global enable_freeform_support 1
+}
+
+set_compact_overlay_density() {
+  adb_shell wm density 90 >/dev/null || true
+  sleep 1
+}
+
+reset_display_density() {
+  adb_shell wm density reset >/dev/null || true
+}
+
+window_overrides_are_reset() {
+  local display_size display_density resizable freeform
+  display_size="$(adb_shell wm size 2>/dev/null | tr -d '\r')" || return 1
+  display_density="$(adb_shell wm density 2>/dev/null | tr -d '\r')" || return 1
+  resizable="$(adb_shell settings get global force_resizable_activities 2>/dev/null |
+    tr -d '\r')" || return 1
+  freeform="$(adb_shell settings get global enable_freeform_support 2>/dev/null |
+    tr -d '\r')" || return 1
+  [[ "$display_size" == "Physical size: 1920x1080" &&
+    "$display_density" == "Physical density: 240" &&
+    ( -z "$resizable" || "$resizable" == "null" ) &&
+    ( -z "$freeform" || "$freeform" == "null" ) ]]
+}
+
+reset_window_overrides() {
+  adb_shell wm size reset >/dev/null || return 1
+  adb_shell wm density reset >/dev/null || return 1
+  adb_shell settings delete global force_resizable_activities >/dev/null || return 1
+  adb_shell settings delete global enable_freeform_support >/dev/null || return 1
+  if ! window_overrides_are_reset; then
+    echo "Android display or legacy window overrides did not reset to the tested state." >&2
+    return 1
+  fi
+}
+
+top_activity() {
+  adb_shell am stack list | awk '
+    /visible=true/ && /topActivity=ComponentInfo/ {
+      sub(/^.*topActivity=ComponentInfo\{/, "")
+      sub(/\}.*/, "")
+      print
+      exit
+    }
+  '
+}
+
+task_for_package() {
+  local package="$1"
+  adb_shell am stack list | awk -v package="$package" '
+    index($0, "taskId=") && index($0, package) {
+      task = $0
+      sub(/^.*taskId=/, "", task)
+      sub(/:.*/, "", task)
+      if (fallback == "") {
+        fallback = task
+      }
+
+      top = $0
+      sub(/^.*topActivity=ComponentInfo\{/, "", top)
+      sub(/\}.*/, "", top)
+      if ($0 ~ /visible=true/ && index(top, package)) {
+        visible = task
+      }
+    }
+    END {
+      if (visible != "") {
+        print visible
+      } else if (fallback != "") {
+        print fallback
+      }
+    }
+  '
+}
+
+task_for_activity() {
+  local activity="$1"
+  adb_shell am stack list | awk -v activity="$activity" '
+    index($0, "taskId=") && index($0, activity) {
+      task = $0
+      sub(/^.*taskId=/, "", task)
+      sub(/:.*/, "", task)
+      if (fallback == "") {
+        fallback = task
+      }
+
+      top = $0
+      sub(/^.*topActivity=ComponentInfo\{/, "", top)
+      sub(/\}.*/, "", top)
+      if ($0 ~ /visible=true/ && index(top, activity)) {
+        visible = task
+      }
+    }
+    END {
+      if (visible != "") {
+        print visible
+      } else if (fallback != "") {
+        print fallback
+      }
+    }
+  '
+}
+
+stack_for_activity() {
+  local activity="$1"
+  adb_shell am stack list | awk -v activity="$activity" '
+    /^Stack id=/ {
+      stack = $0
+      sub(/^Stack id=/, "", stack)
+      sub(/ .*/, "", stack)
+    }
+    index($0, activity) {
+      if (fallback == "") {
+        fallback = stack
+      }
+
+      top = $0
+      sub(/^.*topActivity=ComponentInfo\{/, "", top)
+      sub(/\}.*/, "", top)
+      if ($0 ~ /visible=true/ && index(top, activity)) {
+        visible = stack
+      }
+    }
+    END {
+      if (visible != "") {
+        print visible
+      } else if (fallback != "") {
+        print fallback
+      }
+    }
+  '
+}
+
+is_activity_pinned() {
+  local activity="$1"
+  adb_shell am stack list | awk -v activity="$activity" '
+    /^Stack id=/ {
+      pinned = 0
+    }
+    /mWindowingMode=pinned/ {
+      pinned = 1
+    }
+    index($0, activity) && pinned {
+      found = 1
+    }
+    END {
+      exit found ? 0 : 1
+    }
+  '
+}
+
+pinned_stack_for_activity() {
+  local activity="$1"
+  adb_shell am stack list | awk -v activity="$activity" '
+    /^Stack id=/ {
+      stack = $0
+      sub(/^Stack id=/, "", stack)
+      sub(/ .*/, "", stack)
+      pinned = 0
+    }
+    /mWindowingMode=pinned/ {
+      pinned = 1
+    }
+    index($0, activity) && pinned {
+      print stack
+      exit
+    }
+  '
+}
+
+foreground_content_package() {
+  local foreground
+  foreground="$(foreground_activity || true)"
+  case "$foreground" in
+    com.netflix.mediaclient/*)
+      echo "netflix"
+      ;;
+    org.mozilla.firefox/*)
+      echo "firefox"
+      ;;
+    com.disney.disneyplus/*)
+      echo "disney"
+      ;;
+    com.wbd.stream/*)
+      echo "max"
+      ;;
+    com.wbd.hbomax/*)
+      echo "max"
+      ;;
+    com.hulu.plus/*)
+      echo "hulu"
+      ;;
+    com.apple.atve.androidtv.appletv/*)
+      echo "apple-tv"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+existing_content_package() {
+  adb_shell am stack list | awk '
+    /taskId=/ && /com.netflix.mediaclient/ {
+      print "netflix"
+      exit
+    }
+    /taskId=/ && /org.mozilla.firefox/ {
+      print "firefox"
+      exit
+    }
+    /taskId=/ && /com.disney.disneyplus/ {
+      print "disney"
+      exit
+    }
+    /taskId=/ && /com.wbd.stream/ {
+      print "max"
+      exit
+    }
+    /taskId=/ && /com.wbd.hbomax/ {
+      print "max"
+      exit
+    }
+    /taskId=/ && /com.hulu.plus/ {
+      print "hulu"
+      exit
+    }
+    /taskId=/ && /com.apple.atve.androidtv.appletv/ {
+      print "apple-tv"
+      exit
+    }
+  '
+}
+
+saved_content_package() {
+  local target
+  if [[ ! -f "$LAST_CONTENT_FILE" ]]; then
+    return 1
+  fi
+
+  target="$(tr -d '[:space:]' < "$LAST_CONTENT_FILE")"
+  case "$target" in
+    netflix|firefox|disney|max|hulu|apple-tv)
+      echo "$target"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+remember_content_target() {
+  local target
+  target="$(foreground_content_package || existing_content_package || true)"
+  case "$target" in
+    netflix|firefox|disney|max|hulu|apple-tv)
+      mkdir -p "$STATE_DIR"
+      printf '%s\n' "$target" > "$LAST_CONTENT_FILE"
+      ;;
+  esac
+}
+
+remember_explicit_content_target() {
+  local target="$1"
+  case "$target" in
+    hbo|hbo-max)
+      target="max"
+      ;;
+    appletv)
+      target="apple-tv"
+      ;;
+  esac
+
+  case "$target" in
+    netflix|firefox|disney|max|hulu|apple-tv)
+      mkdir -p "$STATE_DIR"
+      printf '%s\n' "$target" > "$LAST_CONTENT_FILE"
+      ;;
+  esac
+}
+
+content_package() {
+  foreground_content_package || saved_content_package || existing_content_package
+}
+
+wait_for_activity_contains() {
+  local needle="$1"
+  local attempts="${2:-8}"
+  local stacks
+  for _ in $(seq 1 "$attempts"); do
+    stacks="$(adb_shell am stack list || true)"
+    if [[ "$stacks" == *"$needle"* ]]; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+wait_for_visible_activity_contains() {
+  local needle="$1"
+  local attempts="${2:-8}"
+  local stacks
+  for _ in $(seq 1 "$attempts"); do
+    stacks="$(adb_shell am stack list || true)"
+    if awk -v needle="$needle" '
+      /visible=true/ && /topActivity=ComponentInfo/ {
+        top = $0
+        sub(/^.*topActivity=ComponentInfo\{/, "", top)
+        sub(/\}.*/, "", top)
+        if (index(top, needle)) {
+          found = 1
+        }
+      }
+      END {
+        exit found ? 0 : 1
+      }
+    ' <<<"$stacks"; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+foreground_activity() {
+  adb_shell am stack list | awk '
+    /^Stack id=/ {
+      pinned = 0
+    }
+    /mWindowingMode=pinned/ {
+      pinned = 1
+    }
+    /visible=true/ && /topActivity=ComponentInfo/ && !pinned {
+      sub(/^.*topActivity=ComponentInfo\{/, "")
+      sub(/\}.*/, "")
+      print
+      exit
+    }
+  '
+}
+
+quick_check() {
+  require_device
+  local overlay foreground
+  if is_activity_pinned FreestyleWorkoutActivity; then
+    overlay="pinned"
+  elif wait_for_visible_activity_contains "FreestyleWorkoutActivity" 1; then
+    overlay="running, not pinned"
+  else
+    overlay="not running"
+  fi
+  foreground="$(foreground_activity || true)"
+
+  echo "bike ADB: connected"
+  echo "Just Ride: $overlay"
+  echo "Foreground: ${foreground:-unknown}"
+}
+
+dismiss_subscription_banner() {
+  require_device
+  # Close the bike cancelled-subscription banner when it is visible.
+  # These coordinates target the close button at the bike's native 1920x1080
+  # resolution. The helper also dismisses the banner when accessibility can
+  # identify its exact text.
+  adb_shell input tap 1147 31 >/dev/null || true
+  echo "Tried to dismiss the bike subscription banner."
+}
+
+start_just_ride() {
+  require_device
+  if wait_for_visible_activity_contains "FreestyleWorkoutActivity" 1; then
+    echo "Just Ride is running."
+    return 0
+  fi
+
+  echo "Opening bike Just Ride..."
+  adb_shell am start --windowingMode 1 -a android.intent.action.VIEW -d peloton://activation/justride >/dev/null 2>&1 || true
+  if wait_for_visible_activity_contains "FreestyleWorkoutActivity" 8; then
+    echo "Just Ride is running."
+    return 0
+  fi
+
+  # Full-screen and split-screen have different effective tap coordinates.
+  # Try the visible Just Ride card first, then the activation landing-page
+  # "Try a workout or Just Ride" button, then the card again.
+  local tap
+  for tap in \
+    "735 684" \
+    "252 649" \
+    "1740 1004" \
+    "775 930" \
+    "735 684" \
+    "252 649"; do
+    adb_shell input tap $tap
+    if wait_for_visible_activity_contains "FreestyleWorkoutActivity" 4; then
+      echo "Just Ride is running."
+      return 0
+    fi
+  done
+
+  echo "I could not confirm Just Ride. Current top activity: $(top_activity || true)" >&2
+  return 1
+}
+
+close_just_ride_overlay() {
+  require_device
+  local stack
+  stack="$(pinned_stack_for_activity FreestyleWorkoutActivity)"
+  if [[ -z "$stack" ]]; then
+    reset_display_density
+    echo "No Just Ride overlay is pinned."
+    return 0
+  fi
+
+  adb_shell am stack remove "$stack" >/dev/null || true
+  reset_display_density
+  sleep 1
+  echo "Closed pinned Just Ride overlay."
+}
+
+bring_task_front() {
+  local task="$1"
+  adb_shell am task lock "$task" >/dev/null || true
+  adb_shell am task lock stop >/dev/null || true
+}
+
+package_installed() {
+  local package="$1"
+  adb_shell pm path "$package" 2>/dev/null | grep -q '^package:'
+}
+
+resolve_launcher_activity() {
+  local package="$1"
+  local category resolved
+
+  for category in android.intent.category.LAUNCHER android.intent.category.LEANBACK_LAUNCHER; do
+    resolved="$(adb_shell cmd package resolve-activity --brief \
+      -a android.intent.action.MAIN -c "$category" "$package" 2>/dev/null | \
+      tr -d '\r' | \
+      awk -v prefix="$package/" 'index($0, prefix) == 1 {component=$0} END {print component}')"
+    if [[ -n "$resolved" ]]; then
+      printf '%s\n' "$resolved"
+      return 0
+    fi
+  done
+  return 1
+}
+
+ride_controls_fullscreen() {
+  require_device
+  remember_content_target
+  close_just_ride_overlay >/dev/null || true
+
+  local ride_task
+  ride_task="$(task_for_activity FreestyleWorkoutActivity)"
+  if [[ -n "$ride_task" ]]; then
+    bring_task_front "$ride_task"
+  fi
+
+  start_just_ride
+  ride_task="$(task_for_activity FreestyleWorkoutActivity)"
+  if [[ -n "$ride_task" ]]; then
+    bring_task_front "$ride_task"
+  fi
+
+  echo "Just Ride controls are full-screen. Use Restore Ride Overlay when done."
+}
+
+bring_existing_content_front() {
+  local target="${1:-}"
+  if [[ -z "$target" ]]; then
+    target="$(content_package || true)"
+  fi
+
+  case "$target" in
+    netflix)
+      adb_shell am start --windowingMode 1 --activity-reorder-to-front -n com.netflix.mediaclient/.ui.launch.NetflixComLaunchActivity >/dev/null 2>&1 || true
+      remember_explicit_content_target "netflix"
+      echo "Restored Netflix foreground."
+      ;;
+    firefox|browser)
+      adb_shell am start --windowingMode 1 --activity-reorder-to-front -n org.mozilla.firefox/org.mozilla.fenix.HomeActivity >/dev/null 2>&1 || true
+      remember_explicit_content_target "firefox"
+      echo "Restored Firefox foreground."
+      ;;
+    disney)
+      open_disney_native "Restored Disney+ foreground."
+      ;;
+    max|hbo|hbo-max)
+      open_max_native "Restored Max foreground."
+      ;;
+    hulu)
+      open_hulu_native "Restored Hulu foreground."
+      ;;
+    apple-tv|appletv)
+      open_apple_tv_native "Restored Apple TV foreground."
+      ;;
+    "")
+      echo "No existing media app task found to restore."
+      ;;
+    *)
+      echo "Unknown restore target '$target'. Use netflix, firefox, disney, max, hulu, or apple-tv." >&2
+      return 2
+      ;;
+  esac
+}
+
+restore_ride_overlay() {
+  require_device
+  local target="${1:-}"
+  if [[ -z "$target" ]]; then
+    remember_content_target
+  else
+    remember_explicit_content_target "$target"
+  fi
+  pin_just_ride_overlay
+  bring_existing_content_front "$target"
+  echo "Ride overlay restored."
+}
+
+reset_apps() {
+  require_device
+  echo "Stopping bike, Firefox, Netflix, Disney+, Max, Hulu, and Apple TV app tasks..."
+  reset_display_density
+  adb_shell am force-stop com.peloton.activity >/dev/null || true
+  adb_shell am force-stop org.mozilla.firefox >/dev/null || true
+  adb_shell am force-stop com.netflix.mediaclient >/dev/null || true
+  adb_shell am force-stop com.disney.disneyplus >/dev/null || true
+  adb_shell am force-stop com.wbd.stream >/dev/null || true
+  adb_shell am force-stop com.wbd.hbomax >/dev/null || true
+  adb_shell am force-stop com.hulu.plus >/dev/null || true
+  adb_shell am force-stop com.apple.atve.androidtv.appletv >/dev/null || true
+  sleep 1
+  echo "App reset complete."
+}
+
+open_browser() {
+  require_device
+  local url="${1:-https://www.google.com}"
+  echo "Opening Firefox at $url..."
+  adb_shell am start -a android.intent.action.VIEW -d "$url" >/dev/null
+  remember_explicit_content_target "firefox"
+}
+
+open_youtube() {
+  open_browser "https://www.youtube.com"
+}
+
+split_browser() {
+  require_device
+  local url="${1:-https://www.google.com}"
+  enable_window_overrides
+  close_just_ride_overlay >/dev/null
+  start_just_ride
+  open_browser "$url"
+  sleep 3
+
+  local ride_task browser_task
+  ride_task="$(task_for_package com.peloton.activity)"
+  browser_task="$(task_for_package org.mozilla.firefox)"
+
+  if [[ -z "$ride_task" || -z "$browser_task" ]]; then
+    echo "Could not identify split-screen tasks. Ride task='$ride_task', browser task='$browser_task'." >&2
+    adb_shell am stack list
+    exit 1
+  fi
+
+  adb_shell am task resizeable "$ride_task" 2 >/dev/null || true
+  adb_shell am task resizeable "$browser_task" 2 >/dev/null || true
+  adb_shell am stack move-task "$ride_task" 3 true >/dev/null
+  sleep 1
+  adb_shell am stack move-task "$browser_task" 4 true >/dev/null
+  echo "Split-screen is set: Just Ride on the left, Firefox on the right."
+}
+
+split_youtube() {
+  split_browser "https://www.youtube.com"
+}
+
+pin_just_ride_overlay() {
+  require_device
+  enable_window_overrides
+  set_compact_overlay_density
+  if is_activity_pinned FreestyleWorkoutActivity; then
+    echo "Just Ride is already pinned as an overlay."
+    return 0
+  fi
+
+  start_just_ride
+  sleep 1
+  if is_activity_pinned FreestyleWorkoutActivity; then
+    echo "Just Ride is already pinned as an overlay."
+    return 0
+  fi
+
+  local ride_task ride_stack
+  ride_task="$(task_for_activity FreestyleWorkoutActivity)"
+  ride_stack="$(stack_for_activity FreestyleWorkoutActivity)"
+
+  if [[ -z "$ride_task" || -z "$ride_stack" ]]; then
+    echo "Could not identify the Just Ride task for overlay. Ride task='$ride_task', ride stack='$ride_stack'." >&2
+    adb_shell am stack list
+    exit 1
+  fi
+
+  adb_shell am task resizeable "$ride_task" 3 >/dev/null || true
+  adb_shell am stack move-top-activity-to-pinned-stack "$ride_stack" 20 20 900 260 >/dev/null
+  sleep 2
+  echo "Just Ride is pinned as an overlay."
+}
+
+overlay_browser() {
+  require_device
+  local url="${1:-https://www.google.com}"
+  pin_just_ride_overlay
+  echo "Opening Firefox full-screen at $url..."
+  adb_shell am start --windowingMode 1 -a android.intent.action.VIEW -d "$url" >/dev/null
+  remember_explicit_content_target "firefox"
+  echo "Overlay is set: Firefox full-screen with Just Ride on top."
+}
+
+overlay_youtube() {
+  overlay_browser "https://www.youtube.com"
+}
+
+open_disney_native() {
+  local message="${1:-Opening Disney+...}"
+  require_device
+  enable_window_overrides
+  echo "$message"
+  adb_shell am start --windowingMode 1 --activity-reorder-to-front -n com.disney.disneyplus/com.bamtechmedia.dominguez.main.MainActivity >/dev/null
+  remember_explicit_content_target "disney"
+}
+
+open_max_native() {
+  local message="${1:-Opening Max/HBO Max...}"
+  local package component
+  require_device
+  enable_window_overrides
+  echo "$message"
+  package="$(native_target_package max)" || {
+    echo "Neither supported Max package is installed." >&2
+    return 1
+  }
+  component="$(resolve_launcher_activity "$package")" || {
+    echo "Could not resolve a launcher activity for $package." >&2
+    return 1
+  }
+  adb_shell am start --windowingMode 1 --activity-reorder-to-front -n "$component" >/dev/null
+  remember_explicit_content_target "max"
+}
+
+open_hulu_native() {
+  local message="${1:-Opening Hulu...}"
+  require_device
+  enable_window_overrides
+  echo "$message"
+  adb_shell am start --windowingMode 1 --activity-reorder-to-front -n com.hulu.plus/com.hulu.features.splash.SplashActivity >/dev/null
+  remember_explicit_content_target "hulu"
+}
+
+open_apple_tv_native() {
+  local message="${1:-Opening Apple TV...}"
+  require_device
+  enable_window_overrides
+  echo "$message"
+  adb_shell am start --windowingMode 1 --activity-reorder-to-front -n com.apple.atve.androidtv.appletv/com.apple.android.tv.MainActivity >/dev/null
+  remember_explicit_content_target "apple-tv"
+}
+
+open_native_target() {
+  local target="$1"
+  case "$target" in
+    disney)
+      open_disney_native
+      ;;
+    max|hbo|hbo-max)
+      open_max_native
+      ;;
+    hulu)
+      open_hulu_native
+      ;;
+    apple-tv|appletv)
+      open_apple_tv_native
+      ;;
+    *)
+      echo "Unknown native target '$target'." >&2
+      return 2
+      ;;
+  esac
+}
+
+native_target_package() {
+  case "$1" in
+    disney)
+      echo "com.disney.disneyplus"
+      ;;
+    max|hbo|hbo-max)
+      if package_installed com.wbd.stream; then
+        echo "com.wbd.stream"
+      elif package_installed com.wbd.hbomax; then
+        echo "com.wbd.hbomax"
+      else
+        return 1
+      fi
+      ;;
+    hulu)
+      echo "com.hulu.plus"
+      ;;
+    apple-tv|appletv)
+      echo "com.apple.atve.androidtv.appletv"
+      ;;
+    *)
+      return 2
+      ;;
+  esac
+}
+
+native_target_name() {
+  case "$1" in
+    disney)
+      echo "Disney+"
+      ;;
+    max|hbo|hbo-max)
+      echo "Max/HBO Max"
+      ;;
+    hulu)
+      echo "Hulu"
+      ;;
+    apple-tv|appletv)
+      echo "Apple TV"
+      ;;
+    *)
+      return 2
+      ;;
+  esac
+}
+
+split_native_target() {
+  require_device
+  local target="$1"
+  local package name ride_task content_task
+  package="$(native_target_package "$target")"
+  name="$(native_target_name "$target")"
+
+  enable_window_overrides
+  close_just_ride_overlay >/dev/null
+  start_just_ride
+  open_native_target "$target"
+  sleep 5
+
+  ride_task="$(task_for_package com.peloton.activity)"
+  content_task="$(task_for_package "$package")"
+
+  if [[ -z "$ride_task" || -z "$content_task" ]]; then
+    echo "Could not identify split-screen tasks. Ride task='$ride_task', $name task='$content_task'." >&2
+    adb_shell am stack list
+    exit 1
+  fi
+
+  adb_shell am task resizeable "$ride_task" 2 >/dev/null || true
+  adb_shell am task resizeable "$content_task" 2 >/dev/null || true
+  adb_shell am stack move-task "$ride_task" 3 true >/dev/null
+  sleep 1
+  adb_shell am stack move-task "$content_task" 4 true >/dev/null
+  echo "Split-screen is set: Just Ride on the left, $name on the right."
+}
+
+overlay_native_target() {
+  require_device
+  local target="$1"
+  local name
+  name="$(native_target_name "$target")"
+  pin_just_ride_overlay
+  open_native_target "$target"
+  echo "Overlay is set: $name full-screen with Just Ride on top."
+}
+
+login_native_target() {
+  require_device
+  local target="$1"
+  local name
+  name="$(native_target_name "$target")"
+  close_just_ride_overlay >/dev/null
+  echo "Opening $name full-screen for sign-in..."
+  open_native_target "$target" >/dev/null
+  echo "Use the bike screen to sign in, then run the matching overlay command."
+}
+
+open_disney() {
+  require_device
+  if package_installed com.disney.disneyplus; then
+    open_disney_native
+  else
+    open_browser "https://www.disneyplus.com"
+  fi
+}
+
+split_disney() {
+  require_device
+  if package_installed com.disney.disneyplus; then
+    split_native_target "disney"
+  else
+    split_browser "https://www.disneyplus.com"
+  fi
+}
+
+overlay_disney() {
+  require_device
+  if package_installed com.disney.disneyplus; then
+    overlay_native_target "disney"
+  else
+    overlay_browser "https://www.disneyplus.com"
+  fi
+}
+
+open_max() {
+  require_device
+  if package_installed com.wbd.hbomax || package_installed com.wbd.stream; then
+    open_max_native
+  else
+    open_browser "https://www.max.com"
+  fi
+}
+
+split_max() {
+  require_device
+  if package_installed com.wbd.hbomax || package_installed com.wbd.stream; then
+    split_native_target "max"
+  else
+    split_browser "https://www.max.com"
+  fi
+}
+
+overlay_max() {
+  require_device
+  if package_installed com.wbd.hbomax || package_installed com.wbd.stream; then
+    overlay_native_target "max"
+  else
+    overlay_browser "https://www.max.com"
+  fi
+}
+
+open_hulu() {
+  require_device
+  if package_installed com.hulu.plus; then
+    open_hulu_native
+  else
+    open_browser "https://www.hulu.com"
+  fi
+}
+
+split_hulu() {
+  require_device
+  if package_installed com.hulu.plus; then
+    split_native_target "hulu"
+  else
+    split_browser "https://www.hulu.com"
+  fi
+}
+
+overlay_hulu() {
+  require_device
+  if package_installed com.hulu.plus; then
+    overlay_native_target "hulu"
+  else
+    overlay_browser "https://www.hulu.com"
+  fi
+}
+
+open_apple_tv() {
+  require_device
+  if package_installed com.apple.atve.androidtv.appletv; then
+    open_apple_tv_native
+  else
+    open_browser "https://tv.apple.com"
+  fi
+}
+
+split_apple_tv() {
+  require_device
+  if package_installed com.apple.atve.androidtv.appletv; then
+    split_native_target "apple-tv"
+  else
+    split_browser "https://tv.apple.com"
+  fi
+}
+
+overlay_apple_tv() {
+  require_device
+  if package_installed com.apple.atve.androidtv.appletv; then
+    overlay_native_target "apple-tv"
+  else
+    overlay_browser "https://tv.apple.com"
+  fi
+}
+
+open_netflix() {
+  require_device
+  enable_window_overrides
+  echo "Opening Netflix..."
+  adb_shell am start -n com.netflix.mediaclient/.ui.launch.NetflixComLaunchActivity -a android.intent.action.VIEW -d https://www.netflix.com/browse >/dev/null
+  remember_explicit_content_target "netflix"
+}
+
+split_netflix() {
+  require_device
+  enable_window_overrides
+  close_just_ride_overlay >/dev/null
+  start_just_ride
+  adb_shell am force-stop com.netflix.mediaclient >/dev/null || true
+  echo "Opening Netflix..."
+  adb_shell am start --windowingMode 4 -n com.netflix.mediaclient/.ui.launch.NetflixComLaunchActivity -a android.intent.action.VIEW -d https://www.netflix.com/browse >/dev/null
+  remember_explicit_content_target "netflix"
+  sleep 5
+
+  local ride_task netflix_task
+  ride_task="$(task_for_package com.peloton.activity)"
+  netflix_task="$(task_for_package com.netflix.mediaclient)"
+
+  if [[ -z "$ride_task" || -z "$netflix_task" ]]; then
+    echo "Could not identify split-screen tasks. Ride task='$ride_task', Netflix task='$netflix_task'." >&2
+    adb_shell am stack list
+    exit 1
+  fi
+
+  adb_shell am task resizeable "$ride_task" 2 >/dev/null || true
+  adb_shell am task resizeable "$netflix_task" 2 >/dev/null || true
+  adb_shell am stack move-task "$ride_task" 3 true >/dev/null
+  sleep 1
+  adb_shell am stack move-task "$netflix_task" 4 true >/dev/null
+  echo "Split-screen is set: Just Ride on the left, Netflix on the right."
+}
+
+overlay_netflix() {
+  require_device
+  pin_just_ride_overlay
+  adb_shell am force-stop com.netflix.mediaclient >/dev/null || true
+  echo "Opening Netflix full-screen..."
+  adb_shell am start --windowingMode 1 -n com.netflix.mediaclient/.ui.launch.NetflixComLaunchActivity -a android.intent.action.VIEW -d https://www.netflix.com/browse >/dev/null
+  remember_explicit_content_target "netflix"
+  echo "Overlay is set: Netflix full-screen with Just Ride on top."
+}
+
+login_netflix() {
+  require_device
+  close_just_ride_overlay >/dev/null
+  enable_window_overrides
+  echo "Opening Netflix full-screen for sign-in..."
+  adb_shell am force-stop com.netflix.mediaclient >/dev/null || true
+  adb_shell am start --windowingMode 1 -n com.netflix.mediaclient/.ui.launch.NetflixComLaunchActivity -a android.intent.action.VIEW -d https://www.netflix.com/browse >/dev/null
+  remember_explicit_content_target "netflix"
+  echo "Use the bike screen to sign in, then run overlay-netflix."
+}
+
+login_browser_service() {
+  require_device
+  local name="$1"
+  local url="$2"
+  close_just_ride_overlay >/dev/null
+  echo "Opening $name full-screen for sign-in..."
+  adb_shell am start --windowingMode 1 -a android.intent.action.VIEW -d "$url" >/dev/null
+  remember_explicit_content_target "firefox"
+  echo "Use the bike screen to sign in, then run the matching overlay command."
+}
+
+login_disney() {
+  require_device
+  if package_installed com.disney.disneyplus; then
+    login_native_target "disney"
+  else
+    login_browser_service "Disney+" "https://www.disneyplus.com/login"
+  fi
+}
+
+login_max() {
+  require_device
+  if package_installed com.wbd.hbomax || package_installed com.wbd.stream; then
+    login_native_target "max"
+  else
+    login_browser_service "Max/HBO Max" "https://www.max.com/sign-in"
+  fi
+}
+
+login_hulu() {
+  require_device
+  if package_installed com.hulu.plus; then
+    login_native_target "hulu"
+  else
+    login_browser_service "Hulu" "https://www.hulu.com/login"
+  fi
+}
+
+login_apple_tv() {
+  require_device
+  if package_installed com.apple.atve.androidtv.appletv; then
+    login_native_target "apple-tv"
+  else
+    login_browser_service "Apple TV" "https://tv.apple.com"
+  fi
+}
+
+take_screenshot() {
+  require_device
+  local out_dir="$SCRIPT_DIR"
+  local stamp
+  stamp="$(date +%Y%m%d-%H%M%S)"
+  mkdir -p "$out_dir"
+  if ! adb_shell screencap -p "/sdcard/saro-$stamp.png"; then
+    echo "Could not capture the screen. Netflix and other protected video apps can block Android screenshots." >&2
+    return 1
+  fi
+  adb_cmd pull "/sdcard/saro-$stamp.png" "$out_dir/saro-$stamp.png" >/dev/null
+  echo "$out_dir/saro-$stamp.png"
+}
+
+window_agent_token_file() {
+  printf '%s/window-agent-token-%s\n' "$STATE_DIR" "$(device_state_suffix)"
+}
+
+read_window_agent_token() {
+  local token_file token
+  token_file="$(window_agent_token_file)"
+  [[ -f "$token_file" && ! -L "$token_file" ]] || return 1
+  token="$(tr -d '\r\n' <"$token_file")"
+  [[ "$token" =~ ^[0-9a-f]{64}$ ]] || return 1
+  printf '%s\n' "$token"
+}
+
+generate_window_agent_token() {
+  local token_file token
+  mkdir -p "$STATE_DIR"
+  chmod 700 "$STATE_DIR"
+  token_file="$(window_agent_token_file)"
+  if command -v openssl >/dev/null 2>&1; then
+    token="$(openssl rand -hex 32)"
+  else
+    token="$(od -An -N32 -tx1 /dev/urandom | tr -d ' \r\n')"
+  fi
+  if [[ ! "$token" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "Could not generate a valid window-agent capability token." >&2
+    return 1
+  fi
+  umask 077
+  printf '%s\n' "$token" >"$token_file"
+  chmod 600 "$token_file"
+  printf '%s\n' "$token"
+}
+
+window_agent_request() {
+  require_device
+  local command="$1"
+  local token
+  token="$(read_window_agent_token)" || {
+    echo "No valid capability token is recorded for the research window agent." >&2
+    return 1
+  }
+  case "$command" in
+    ping|shutdown) ;;
+    *) echo "Refusing unsupported host window-agent command: $command" >&2; return 1 ;;
+  esac
+  adb_cmd shell "printf '%s %s\\n' '$token' '$command' | nc -w 2 127.0.0.1 47631" 2>/dev/null
+}
+
+window_agent_ping() {
+  window_agent_request ping || true
+}
+
+window_agent_status() {
+  require_device
+  local response
+  response="$(window_agent_ping)"
+  if [[ "$response" == "OK pong" ]]; then
+    echo "Tablet window agent: running"
+  else
+    echo "Tablet window agent: not responding"
+    return 1
+  fi
+}
+
+stop_window_agent() {
+  require_device
+  local token_file response
+  token_file="$(window_agent_token_file)"
+  response="$(window_agent_request shutdown 2>/dev/null || true)"
+  if [[ "$response" != "OK shutting down" && "$response" != "OK shutdown" ]]; then
+    adb_shell pkill -f com.pelotonhack.windowagent.TabletWindowAgent >/dev/null 2>&1 || true
+  fi
+  adb_shell rm -f /data/local/tmp/saro-window-agent.jar /data/local/tmp/saro-window-agent.log \
+    >/dev/null 2>&1 || true
+  rm -f "$token_file"
+  reset_display_density
+  echo "Tablet window agent stopped and display density restored."
+}
+
+start_window_agent() {
+  require_device
+  if [[ "${SARO_ENABLE_UNSAFE_WINDOW_AGENT:-}" != "1" || "${1:-}" != "--acknowledge-shell-risk" ]]; then
+    echo "The shell-privileged research window agent is quarantined." >&2
+    echo "For owner-directed research only, set SARO_ENABLE_UNSAFE_WINDOW_AGENT=1 and pass --acknowledge-shell-risk." >&2
+    return 1
+  fi
+  local jar="$SCRIPT_DIR/window-agent/build/saro-window-agent.jar"
+  local token token_file
+  if [[ ! -f "$jar" ]]; then
+    "$SCRIPT_DIR/window-agent/build.sh"
+  fi
+
+  adb_cmd push "$jar" /data/local/tmp/saro-window-agent.jar >/dev/null
+  adb_shell pkill -f com.pelotonhack.windowagent.TabletWindowAgent >/dev/null 2>&1 || true
+  token="$(generate_window_agent_token)"
+  token_file="$(window_agent_token_file)"
+  adb_cmd shell "CLASSPATH=/data/local/tmp/saro-window-agent.jar nohup app_process /system/bin com.pelotonhack.windowagent.TabletWindowAgent '$token' >/data/local/tmp/saro-window-agent.log 2>&1 &"
+  sleep 3
+  if ! window_agent_status; then
+    adb_shell pkill -f com.pelotonhack.windowagent.TabletWindowAgent >/dev/null 2>&1 || true
+    rm -f "$token_file"
+    return 1
+  fi
+}
+
+device_state_suffix() {
+  printf '%s' "${ANDROID_SERIAL:-unknown}" | tr -c 'A-Za-z0-9._-' '_'
+}
+
+previous_home_file() {
+  printf '%s/previous-home-%s\n' "$STATE_DIR" "$(device_state_suffix)"
+}
+
+current_home_component() {
+  adb_shell cmd package resolve-activity --brief \
+    -a android.intent.action.MAIN \
+    -c android.intent.category.HOME 2>/dev/null |
+    tr -d '\r' |
+    awk '/^[A-Za-z0-9_.]+\/[A-Za-z0-9_.$]+$/ {component=$0} END {print component}'
+}
+
+query_home_components() {
+  adb_shell cmd package query-activities --brief \
+    -a android.intent.action.MAIN \
+    -c android.intent.category.HOME 2>/dev/null |
+    tr -d '\r' |
+    awk '{
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "")
+      if ($0 ~ /^[A-Za-z0-9_.]+\/[A-Za-z0-9_.$]+$/) print
+    }'
+}
+
+component_package() {
+  printf '%s\n' "${1%%/*}"
+}
+
+valid_component() {
+  [[ "$1" =~ ^[A-Za-z0-9_.]+/[A-Za-z0-9_.$]+$ ]]
+}
+
+safe_previous_home_component() {
+  local component="$1"
+  valid_component "$component" || return 1
+  case "$component" in
+    com.android.settings/.FallbackHome) return 1 ;;
+  esac
+  [[ "$(component_package "$component")" != "$HELPER_PACKAGE" ]]
+}
+
+valid_previous_home_component() {
+  local component="$1"
+  local package
+  safe_previous_home_component "$component" || return 1
+  package="$(component_package "$component")"
+  adb_shell pm path "$package" 2>/dev/null | grep -q '^package:' || return 1
+  query_home_components | grep -Fxq "$component"
+}
+
+infer_previous_home() {
+  local candidates candidate count
+  candidates="$(mktemp "${TMPDIR:-/tmp}/saro-home-candidates.XXXXXX")"
+  while IFS= read -r candidate; do
+    [[ -n "$candidate" ]] || continue
+    if valid_previous_home_component "$candidate"; then
+      printf '%s\n' "$candidate"
+    fi
+  done < <(query_home_components) | LC_ALL=C sort -u >"$candidates"
+  count="$(wc -l <"$candidates" | tr -d ' ')"
+  if [[ "$count" != "1" ]]; then
+    echo "Could not infer exactly one safe original Home component (found $count)." >&2
+    if [[ -s "$candidates" ]]; then
+      sed 's/^/  candidate: /' "$candidates" >&2
+    fi
+    rm -f "$candidates"
+    return 1
+  fi
+  cat "$candidates"
+  rm -f "$candidates"
+}
+
+write_previous_home() {
+  local component="$1"
+  local state_file temporary
+  state_file="$(previous_home_file)"
+  mkdir -p "$STATE_DIR"
+  chmod 700 "$STATE_DIR" 2>/dev/null || true
+  temporary="$(mktemp "$STATE_DIR/.previous-home.XXXXXX")"
+  printf '%s\n' "$component" >"$temporary"
+  chmod 600 "$temporary" 2>/dev/null || true
+  mv "$temporary" "$state_file"
+}
+
+record_previous_home() {
+  require_device
+  local current recorded state_file
+  state_file="$(previous_home_file)"
+  current="$(current_home_component)"
+  if [[ -z "$current" ]]; then
+    echo "Could not resolve the current Home component." >&2
+    return 1
+  fi
+  if [[ -s "$state_file" ]]; then
+    recorded="$(tr -d '\r\n' <"$state_file")"
+    if valid_previous_home_component "$recorded"; then
+      if [[ "$current" == "$recorded" || "$current" == "$HELPER_COMPONENT" ||
+        "$current" == "com.android.settings/.FallbackHome" ]]; then
+        return 0
+      fi
+      echo "Current Home $current conflicts with recorded original Home $recorded." >&2
+      echo "Refusing to replace the rollback record automatically." >&2
+      return 1
+    else
+      echo "Recorded previous Home component is no longer a valid Home candidate: ${recorded:-<empty>}" >&2
+      return 1
+    fi
+  fi
+  if ! valid_previous_home_component "$current"; then
+    current="$(infer_previous_home)" || return 1
+    echo "Inferred original Home component: $current"
+  fi
+  write_previous_home "$current"
+}
+
+record_home_rollback() {
+  record_previous_home
+  echo "Original Home rollback recorded as $(tr -d '\r\n' <"$(previous_home_file)")"
+}
+
+health_check_helper() {
+  require_device
+  local resolved launch
+  resolved="$(adb_shell cmd package resolve-activity --brief \
+    -a android.intent.action.MAIN \
+    -c android.intent.category.HOME \
+    "$HELPER_PACKAGE" 2>/dev/null | tr -d '\r' |
+    awk '/^[A-Za-z0-9_.]+\/[A-Za-z0-9_.$]+$/ {component=$0} END {print component}')"
+  if [[ "$resolved" != "$HELPER_COMPONENT" ]]; then
+    echo "SARO Home activity did not resolve to $HELPER_COMPONENT (got ${resolved:-nothing})." >&2
+    return 1
+  fi
+  launch="$(adb_shell am start -W -n "$HELPER_COMPONENT" 2>&1)" || {
+    echo "SARO Home activity failed to launch: $launch" >&2
+    return 1
+  }
+  if ! grep -Eq '^Status:[[:space:]]*ok$' <<<"$(tr -d '\r' <<<"$launch")"; then
+    echo "SARO Home health check did not receive an Android launch acknowledgement." >&2
+    echo "$launch" >&2
+    return 1
+  fi
+}
+
+assign_saro_home() {
+  if ! record_previous_home; then
+    return 1
+  fi
+  if ! health_check_helper; then
+    return 1
+  fi
+  if ! adb_shell cmd package set-home-activity "$HELPER_COMPONENT" >/dev/null; then
+    echo "Android rejected the SARO Home assignment." >&2
+    return 1
+  fi
+  if [[ "$(current_home_component)" != "$HELPER_COMPONENT" ]]; then
+    echo "Android did not retain SARO as the Home component." >&2
+    return 1
+  fi
+}
+
+restore_home() {
+  require_device
+  local state_file component package
+  state_file="$(previous_home_file)"
+  if [[ ! -s "$state_file" ]]; then
+    echo "No previous Home component is recorded for device '$ANDROID_SERIAL'." >&2
+    return 1
+  fi
+  component="$(tr -d '\r\n' <"$state_file")"
+  if ! valid_previous_home_component "$component"; then
+    echo "Recorded Home component is not a current safe Home candidate: ${component:-<empty>}" >&2
+    return 1
+  fi
+  package="$(component_package "$component")"
+  if ! adb_shell pm path "$package" 2>/dev/null | grep -q '^package:'; then
+    echo "Recorded Home package is not installed: $package" >&2
+    return 1
+  fi
+  adb_shell cmd package set-home-activity "$component" >/dev/null
+  if [[ "$(current_home_component)" != "$component" ]]; then
+    echo "Android did not restore the recorded Home component: $component" >&2
+    return 1
+  fi
+  adb_shell am start -W -n "$component" >/dev/null
+  echo "Home restored to $component"
+}
+
+safe_uninstall() {
+  require_device
+  restore_home
+  disable_helper_accessibility
+  reset_window_overrides
+  adb_cmd uninstall "$HELPER_PACKAGE"
+  echo "SARO uninstalled after restoring the previous Home component."
+}
+
+disable_helper_accessibility() {
+  local enabled_services filtered
+  enabled_services="$(adb_shell settings get secure enabled_accessibility_services 2>/dev/null |
+    tr -d '\r')" || return 1
+  filtered="$(printf '%s\n' "$enabled_services" | tr ':' '\n' |
+    awk -v ride="$HELPER_ACCESSIBILITY" -v tv="$HELPER_TV_ACCESSIBILITY" '
+      $0 != "" && $0 != "null" && $0 != ride && $0 != tv {
+        if (result != "") result = result ":"
+        result = result $0
+      }
+      END {print result}
+    ')"
+  if [[ -n "$filtered" ]]; then
+    adb_shell settings put secure enabled_accessibility_services "$filtered" || return 1
+  else
+    adb_shell settings delete secure enabled_accessibility_services >/dev/null || return 1
+    adb_shell settings put secure accessibility_enabled 0 || return 1
+  fi
+}
+
+deploy_helper() {
+  require_device
+  local helper_dir="$SCRIPT_DIR/ride-starter"
+  local helper_apk="$helper_dir/build/ride-starter.apk"
+  local enabled_services
+
+  "$helper_dir/build.sh"
+  adb_cmd install -r "$helper_apk"
+
+  enabled_services="$(adb_shell settings get secure enabled_accessibility_services | tr -d '\r')"
+  case ":$enabled_services:" in
+    *":$HELPER_ACCESSIBILITY:"*)
+      ;;
+    :null:|::)
+      adb_shell settings put secure enabled_accessibility_services "$HELPER_ACCESSIBILITY"
+      ;;
+    *)
+      adb_shell settings put secure enabled_accessibility_services \
+        "$enabled_services:$HELPER_ACCESSIBILITY"
+      ;;
+  esac
+  adb_shell settings put secure accessibility_enabled 1
+  assign_saro_home
+  echo "Ride helper installed, health-checked, accessibility enabled, and Home assigned."
+}
+
+bootstrap_tablet() {
+  require_device
+  # Establish the rollback target before the first device mutation.
+  record_previous_home
+  reset_window_overrides
+  stop_window_agent >/dev/null
+  deploy_helper
+  echo "Tablet bootstrap complete. All ride and launcher functions now run on the tablet."
+}
+
+config_request_id() {
+  printf '%s-%s-%s\n' "$(date -u +%Y%m%dT%H%M%SZ)" "$$" "${RANDOM:-0}"
+}
+
+wait_for_config_status() {
+  local request_id="$1"
+  local action="$2"
+  local status_file="$3"
+  local attempts="${CONFIG_STATUS_ATTEMPTS:-24}"
+  local delay="${CONFIG_STATUS_SLEEP:-0.25}"
+  local attempt=0 compact remote_status
+
+  while [[ "$attempt" -lt "$attempts" ]]; do
+    for remote_status in "$CONFIG_STATUS_REMOTE" "$LEGACY_CONFIG_STATUS_REMOTE"; do
+      if adb_shell test -f "$remote_status" >/dev/null 2>&1; then
+        if adb_cmd pull "$remote_status" "$status_file" >/dev/null 2>&1; then
+        compact="$(tr -d '\r\n' <"$status_file")"
+        if grep -Eq '^\{.*\}$' <<<"$compact" &&
+          grep -Eq '"requestId"[[:space:]]*:[[:space:]]*"'"$request_id"'"' <<<"$compact" &&
+          grep -Eq '"action"[[:space:]]*:[[:space:]]*"'"$action"'"' <<<"$compact"; then
+          if grep -Eq '"ok"[[:space:]]*:[[:space:]]*true([,}])' <<<"$compact"; then
+            return 0
+          fi
+          echo "SARO reported that configuration $action failed: $compact" >&2
+          return 1
+        fi
+      fi
+      fi
+    done
+    attempt=$((attempt + 1))
+    sleep "$delay"
+  done
+  echo "Timed out waiting for matching SARO configuration acknowledgement ($action, request $request_id)." >&2
+  return 1
+}
+
+export_config() {
+  require_device
+  local output="${1:-$PWD/saro-setup.json}"
+  local output_dir request_id status_file launch
+  output_dir="$(dirname "$output")"
+  mkdir -p "$output_dir"
+  request_id="$(config_request_id)"
+  status_file="$(mktemp "${TMPDIR:-/tmp}/saro-config-status.XXXXXX")"
+  if ! adb_shell rm -f "$CONFIG_STATUS_REMOTE" "$LEGACY_CONFIG_STATUS_REMOTE"; then
+    rm -f "$status_file"
+    echo "Could not clear the previous SARO configuration status." >&2
+    return 1
+  fi
+  launch="$(adb_shell am start \
+    -a "$HELPER_PACKAGE.EXPORT_CONFIG" \
+    --es request_id "$request_id" \
+    -n "$HELPER_PACKAGE/.ConfigTransferActivity" 2>&1)" || {
+    rm -f "$status_file"
+    echo "Could not start SARO configuration export: $launch" >&2
+    return 1
+  }
+  if ! wait_for_config_status "$request_id" "$HELPER_PACKAGE.EXPORT_CONFIG" "$status_file"; then
+    rm -f "$status_file"
+    return 1
+  fi
+  rm -f "$status_file"
+  if ! adb_cmd pull "$CONFIG_REMOTE" "$output" >/dev/null 2>&1 &&
+    ! adb_cmd pull "$LEGACY_CONFIG_REMOTE" "$output" >/dev/null; then
+    echo "SARO acknowledged export, but the configuration file could not be pulled." >&2
+    return 1
+  fi
+  if [[ ! -s "$output" ]]; then
+    echo "SARO acknowledged export but produced an empty configuration file." >&2
+    return 1
+  fi
+  echo "Configuration exported to $output"
+}
+
+import_config() {
+  require_device
+  local input="${1:-}"
+  local request_id status_file launch
+  if [[ -z "$input" || ! -f "$input" ]]; then
+    echo "Configuration file not found: ${input:-<missing path>}" >&2
+    return 1
+  fi
+  if ! adb_shell mkdir -p "$(dirname "$CONFIG_REMOTE")"; then
+    echo "Could not create the SARO configuration directory." >&2
+    return 1
+  fi
+  if ! adb_cmd push "$input" "$CONFIG_REMOTE" >/dev/null ||
+    ! adb_cmd push "$input" "$LEGACY_CONFIG_REMOTE" >/dev/null; then
+    echo "Could not stage the SARO configuration file." >&2
+    return 1
+  fi
+  request_id="$(config_request_id)"
+  status_file="$(mktemp "${TMPDIR:-/tmp}/saro-config-status.XXXXXX")"
+  if ! adb_shell rm -f "$CONFIG_STATUS_REMOTE" "$LEGACY_CONFIG_STATUS_REMOTE"; then
+    rm -f "$status_file"
+    echo "Could not clear the previous SARO configuration status." >&2
+    return 1
+  fi
+  launch="$(adb_shell am start \
+    -a "$HELPER_PACKAGE.IMPORT_CONFIG" \
+    --es request_id "$request_id" \
+    -n "$HELPER_PACKAGE/.ConfigTransferActivity" 2>&1)" || {
+    rm -f "$status_file"
+    echo "Could not start SARO configuration import: $launch" >&2
+    return 1
+  }
+  if ! wait_for_config_status "$request_id" "$HELPER_PACKAGE.IMPORT_CONFIG" "$status_file"; then
+    rm -f "$status_file"
+    return 1
+  fi
+  rm -f "$status_file"
+  echo "Configuration restored from $input"
+}
+
+backup_third_party_apks() {
+  local destination="$1"
+  local manifest="$destination/manifest.tsv"
+  local manifest_tmp="$destination/.manifest.tsv.tmp"
+  local packages_file="$destination/.packages.tmp"
+  local package remote_path package_dir package_dump version_line
+  local version_code version_name filename local_path hash row_count=0 package_row_count
+  mkdir -p "$destination"
+  printf 'package\tversion_code\tversion_name\tapk\tsha256\n' >"$manifest_tmp"
+  adb_shell pm list packages -3 | tr -d '\r' | sed 's/^package://' | LC_ALL=C sort >"$packages_file"
+  while IFS= read -r package; do
+    [[ -n "$package" ]] || continue
+    case "$package" in
+      com.peloton.*|com.onepeloton.*|"$HELPER_PACKAGE") continue ;;
+    esac
+    if [[ ! "$package" =~ ^[A-Za-z0-9_]+([.][A-Za-z0-9_]+)+$ ]]; then
+      echo "Refusing malformed installed package name: $package" >&2
+      rm -f "$manifest_tmp" "$packages_file"
+      return 1
+    fi
+    package_dir="$destination/$package"
+    mkdir -p "$package_dir"
+    package_dump="$(adb_shell dumpsys package "$package" </dev/null | tr -d '\r')"
+    version_line="$(awk '/versionCode=/{print; exit}' <<<"$package_dump")"
+    version_code=""
+    version_name=""
+    if [[ "$version_line" =~ versionCode=([^[:space:]]+) ]]; then
+      version_code="${BASH_REMATCH[1]}"
+    fi
+    version_line="$(awk '/versionName=/{print; exit}' <<<"$package_dump")"
+    if [[ "$version_line" =~ versionName=(.*)$ ]]; then
+      version_name="${BASH_REMATCH[1]}"
+      version_name="${version_name#"${version_name%%[![:space:]]*}"}"
+    fi
+    if [[ -z "$version_code" || "$version_code" == *$'\t'* || "$version_name" == *$'\t'* ]]; then
+      echo "Could not record safe version metadata for $package" >&2
+      rm -f "$manifest_tmp" "$packages_file"
+      return 1
+    fi
+    package_row_count=0
+    while IFS= read -r remote_path; do
+      remote_path="${remote_path#package:}"
+      [[ -n "$remote_path" ]] || continue
+      filename="${remote_path##*/}"
+      if [[ ! "$filename" =~ ^[A-Za-z0-9._-]+[.]apk$ || -e "$package_dir/$filename" ]]; then
+        echo "Refusing unsafe or duplicate APK filename for $package: $filename" >&2
+        rm -f "$manifest_tmp" "$packages_file"
+        return 1
+      fi
+      local_path="$package_dir/$filename"
+      adb_cmd pull "$remote_path" "$local_path" </dev/null >/dev/null
+      hash="$(sha256_file "$local_path")"
+      printf '%s\t%s\t%s\t%s/%s\t%s\n' \
+        "$package" "$version_code" "$version_name" "$package" "$filename" "$hash" \
+        >>"$manifest_tmp"
+      row_count=$((row_count + 1))
+      package_row_count=$((package_row_count + 1))
+    done < <(adb_shell pm path "$package" </dev/null | tr -d '\r')
+    if [[ "$package_row_count" == "0" ]]; then
+      echo "ADB reported no APK paths for third-party package $package" >&2
+      rm -f "$manifest_tmp" "$packages_file"
+      return 1
+    fi
+  done <"$packages_file"
+  rm -f "$packages_file"
+  if [[ "$row_count" == "0" ]]; then
+    echo "ADB reported no third-party APK files; refusing to create a header-only archive." >&2
+    rm -f "$manifest_tmp"
+    return 1
+  fi
+  mv "$manifest_tmp" "$manifest"
+}
+
+backup_expansion_files() {
+  local destination="$1"
+  local manifest="$destination/manifest.tsv"
+  local manifest_tmp="$destination/.manifest.tsv.tmp"
+  local packages_file="$destination/.packages.tmp"
+  local remote_files="$destination/.remote-files.tmp"
+  local remote package filename tail version relative local_path hash bytes
+  local row_count=0
+
+  mkdir -p "$destination"
+  printf 'package\tversion_code\tobb\tbytes\tsha256\n' >"$manifest_tmp"
+  adb_shell pm list packages -3 | tr -d '\r' | sed 's/^package://' | LC_ALL=C sort >"$packages_file"
+  adb_shell find /sdcard/Android/obb -type f -name '*.obb' | tr -d '\r' >"$remote_files"
+
+  while IFS= read -r remote; do
+    [[ -n "$remote" ]] || continue
+    if [[ ! "$remote" =~ ^/sdcard/Android/obb/([A-Za-z0-9_]+([.][A-Za-z0-9_]+)+)/([^/]+[.]obb)$ ]]; then
+      echo "Refusing unsafe expansion-file path reported by ADB: $remote" >&2
+      return 1
+    fi
+    package="${BASH_REMATCH[1]}"
+    filename="${BASH_REMATCH[3]}"
+    if ! grep -Fxq "$package" "$packages_file"; then
+      continue
+    fi
+    case "$filename" in
+      main.*|patch.*) ;;
+      *)
+        echo "Refusing unsupported expansion-file name: $filename" >&2
+        return 1
+        ;;
+    esac
+    tail="${filename#*.}"
+    version="${tail%%.*}"
+    if [[ ! "$version" =~ ^[0-9]+$ || "${tail#*.}" != "$package.obb" ]]; then
+      echo "Expansion-file name does not match its package: $remote" >&2
+      return 1
+    fi
+    relative="$package/$filename"
+    local_path="$destination/$relative"
+    if [[ -e "$local_path" ]]; then
+      echo "Refusing duplicate expansion-file path: $relative" >&2
+      return 1
+    fi
+    mkdir -p "$destination/$package"
+    adb_cmd pull "$remote" "$local_path" </dev/null >/dev/null
+    bytes="$(wc -c <"$local_path" | tr -d ' ')"
+    hash="$(sha256_file "$local_path")"
+    printf '%s\t%s\t%s\t%s\t%s\n' \
+      "$package" "$version" "$relative" "$bytes" "$hash" >>"$manifest_tmp"
+    row_count=$((row_count + 1))
+  done <"$remote_files"
+
+  rm -f "$packages_file" "$remote_files"
+  if [[ "$row_count" == "0" ]]; then
+    rm -f "$manifest_tmp"
+    rmdir "$destination"
+    return 0
+  fi
+  mv "$manifest_tmp" "$manifest"
+}
+
+write_backup_device_info() {
+  local destination="$1"
+  {
+    printf 'model=%s\n' "$(adb_shell getprop ro.product.model | tr -d '\r')"
+    printf 'product=%s\n' "$(adb_shell getprop ro.product.name | tr -d '\r')"
+    printf 'device=%s\n' "$(adb_shell getprop ro.product.device | tr -d '\r')"
+    printf 'android_release=%s\n' "$(adb_shell getprop ro.build.version.release | tr -d '\r')"
+    printf 'api=%s\n' "$(adb_shell getprop ro.build.version.sdk | tr -d '\r')"
+    printf 'abi_list=%s\n' "$(adb_shell getprop ro.product.cpu.abilist | tr -d '\r')"
+    printf 'security_patch=%s\n' "$(adb_shell getprop ro.build.version.security_patch | tr -d '\r')"
+    printf 'fingerprint=%s\n' "$(adb_shell getprop ro.build.fingerprint | tr -d '\r')"
+  } >"$destination/device-info.txt"
+}
+
+create_backup_contents() {
+  local destination="$1"
+  local include_apks="$2"
+  local helper_paths helper_remote previous_file
+
+  # A recovery bundle is incomplete if it cannot leave SARO Home safely.
+  record_previous_home
+  export_config "$destination/saro-setup.json"
+  write_backup_device_info "$destination"
+
+  helper_paths="$(adb_shell pm path "$HELPER_PACKAGE" | tr -d '\r')"
+  if [[ "$(grep -c '^package:' <<<"$helper_paths" || true)" != "1" ]]; then
+    echo "Expected exactly one installed SARO helper APK to back up." >&2
+    return 1
+  fi
+  helper_remote="${helper_paths#package:}"
+  adb_cmd pull "$helper_remote" "$destination/ride-starter.apk" >/dev/null
+
+  if [[ "$include_apks" == "--with-apks" ]]; then
+    backup_third_party_apks "$destination/apks"
+    backup_expansion_files "$destination/obb"
+  fi
+  previous_file="$(previous_home_file)"
+  cp "$previous_file" "$destination/previous-home.txt"
+  write_top_level_manifest "$destination"
+}
+
+cleanup_backup_stage() {
+  local stage="$1"
+  local parent="$2"
+  local base="$3"
+  case "$stage" in
+    "$parent"/."$base".tmp.*)
+      if [[ -e "$stage" ]]; then
+        find "$stage" -depth -delete
+      fi
+      ;;
+    *)
+      echo "Refusing to clean unexpected backup staging path: $stage" >&2
+      return 1
+      ;;
+  esac
+}
+
+create_backup() {
+  require_device
+  local destination="${1:-$PWD/saro-backup-$(date +%Y%m%d-%H%M%S)}"
+  local include_apks="${2:-}"
+  local parent base stage stage_status
+  if [[ -n "$include_apks" && "$include_apks" != "--with-apks" ]]; then
+    echo "Unknown backup option: $include_apks" >&2
+    return 1
+  fi
+
+  while [[ "$destination" != "/" && "$destination" == */ ]]; do
+    destination="${destination%/}"
+  done
+  parent="$(dirname "$destination")"
+  base="$(basename "$destination")"
+  if [[ -z "$base" || "$base" == "." || "$base" == ".." || "$destination" == "/" ]]; then
+    echo "Refusing unsafe backup destination: $destination" >&2
+    return 1
+  fi
+  if [[ -L "$destination" || (-e "$destination" && ! -d "$destination") ]]; then
+    echo "Backup destination must be a directory, not a file or symlink: $destination" >&2
+    return 1
+  fi
+  if [[ -d "$destination" && -n "$(find "$destination" -mindepth 1 -print -quit)" ]]; then
+    echo "Backup destination is not empty: $destination" >&2
+    return 1
+  fi
+  mkdir -p "$parent"
+  stage="$(mktemp -d "$parent/.${base}.tmp.XXXXXX")"
+
+  # Run staged creation with errexit active outside a conditional context so
+  # an unhandled ADB, hashing, or filesystem failure cannot publish a backup.
+  set +e
+  (
+    set -e
+    create_backup_contents "$stage" "$include_apks"
+  )
+  stage_status=$?
+  set -e
+  if [[ "$stage_status" != "0" ]]; then
+    cleanup_backup_stage "$stage" "$parent" "$base"
+    echo "Backup failed; no partial backup was published at $destination" >&2
+    return "$stage_status"
+  fi
+
+  if [[ -e "$destination" ]]; then
+    if [[ -L "$destination" || ! -d "$destination" ||
+      -n "$(find "$destination" -mindepth 1 -print -quit)" ]]; then
+      cleanup_backup_stage "$stage" "$parent" "$base"
+      echo "Backup destination changed while the backup was being created: $destination" >&2
+      return 1
+    fi
+    if ! rmdir "$destination"; then
+      cleanup_backup_stage "$stage" "$parent" "$base"
+      echo "Could not prepare the empty backup destination: $destination" >&2
+      return 1
+    fi
+  fi
+  if ! mv "$stage" "$destination"; then
+    cleanup_backup_stage "$stage" "$parent" "$base"
+    echo "Could not publish the completed backup at $destination" >&2
+    return 1
+  fi
+  echo "Recovery backup created at $destination"
+}
+
+write_top_level_manifest() {
+  local destination="$1"
+  local output="$destination/manifest.tsv"
+  local temporary="$destination/.manifest.tsv.tmp"
+  local path
+  printf 'path\tsha256\n' >"$temporary"
+  for path in ride-starter.apk saro-setup.json device-info.txt; do
+    printf '%s\t%s\n' "$path" "$(sha256_file "$destination/$path")" >>"$temporary"
+  done
+  if [[ -f "$destination/previous-home.txt" ]]; then
+    printf 'previous-home.txt\t%s\n' "$(sha256_file "$destination/previous-home.txt")" >>"$temporary"
+  fi
+  if [[ -f "$destination/apks/manifest.tsv" ]]; then
+    printf 'apks/manifest.tsv\t%s\n' "$(sha256_file "$destination/apks/manifest.tsv")" >>"$temporary"
+  fi
+  if [[ -f "$destination/obb/manifest.tsv" ]]; then
+    printf 'obb/manifest.tsv\t%s\n' "$(sha256_file "$destination/obb/manifest.tsv")" >>"$temporary"
+  fi
+  mv "$temporary" "$output"
+}
+
+write_original_state_device_info() {
+  local destination="$1"
+  local android_info="$destination/.android-device-info.tmp"
+  local saro_installed=false
+  mkdir "$android_info"
+  write_backup_device_info "$android_info"
+  if adb_shell pm path "$HELPER_PACKAGE" 2>/dev/null | grep -q '^package:'; then
+    saro_installed=true
+  fi
+  {
+    printf 'adb_serial=%s\n' "$ANDROID_SERIAL"
+    cat "$android_info/device-info.txt"
+    printf 'saro_installed=%s\n' "$saro_installed"
+  } >"$destination/device-info.txt"
+  rm -f "$android_info/device-info.txt"
+  rmdir "$android_info"
+}
+
+write_original_state_settings() {
+  local destination="$1"
+  local namespace key value
+  printf 'namespace\tkey\tvalue\n' >"$destination/settings.tsv"
+  while IFS=$'\t' read -r namespace key; do
+    value="$(adb_shell settings get "$namespace" "$key" | tr -d '\r')"
+    if [[ "$value" == *$'\n'* || "$value" == *$'\t'* ]]; then
+      echo "Android returned an unsafe multi-line setting for $namespace/$key" >&2
+      return 1
+    fi
+    printf '%s\t%s\t%s\n' "$namespace" "$key" "$value" \
+      >>"$destination/settings.tsv"
+  done <<'SETTINGS'
+secure	enabled_accessibility_services
+secure	accessibility_enabled
+global	force_resizable_activities
+global	enable_freeform_support
+SETTINGS
+}
+
+write_original_state_packages() {
+  local destination="$1"
+  local packages_file="$destination/.packages.tmp"
+  local package package_dump version_line version_code version_name
+  adb_shell pm list packages -3 | tr -d '\r' | sed 's/^package://' |
+    LC_ALL=C sort -u >"$packages_file"
+  printf 'package\tversion_code\tversion_name\n' \
+    >"$destination/third-party-packages.tsv"
+  while IFS= read -r package; do
+    [[ -n "$package" ]] || continue
+    if [[ ! "$package" =~ ^[A-Za-z0-9_]+([.][A-Za-z0-9_]+)+$ ]]; then
+      echo "Refusing malformed installed package name: $package" >&2
+      return 1
+    fi
+    package_dump="$(adb_shell dumpsys package "$package" </dev/null | tr -d '\r')"
+    version_line="$(awk '/versionCode=/{print; exit}' <<<"$package_dump")"
+    version_code=""
+    if [[ "$version_line" =~ versionCode=([0-9]+) ]]; then
+      version_code="${BASH_REMATCH[1]}"
+    fi
+    version_line="$(awk '/versionName=/{print; exit}' <<<"$package_dump")"
+    version_name="<unset>"
+    if [[ "$version_line" =~ versionName=(.*)$ ]]; then
+      version_name="${BASH_REMATCH[1]}"
+      version_name="${version_name#"${version_name%%[![:space:]]*}"}"
+      [[ -n "$version_name" ]] || version_name="<unset>"
+    fi
+    if [[ -z "$version_code" || "$version_name" == *$'\t'* ||
+      "$version_name" == *$'\n'* ]]; then
+      echo "Could not record safe version metadata for $package" >&2
+      return 1
+    fi
+    printf '%s\t%s\t%s\n' "$package" "$version_code" "$version_name" \
+      >>"$destination/third-party-packages.tsv"
+  done <"$packages_file"
+  rm -f "$packages_file"
+}
+
+write_original_state_manifest() {
+  local destination="$1"
+  local path
+  printf 'path\tsha256\n' >"$destination/manifest.tsv"
+  for path in current-home.txt previous-home.txt device-info.txt display-size.txt \
+    display-density.txt settings.tsv third-party-packages.tsv; do
+    printf '%s\t%s\n' "$path" "$(sha256_file "$destination/$path")" \
+      >>"$destination/manifest.tsv"
+  done
+}
+
+create_original_state_contents() {
+  local destination="$1"
+  local current previous_file display_size display_density
+  record_previous_home
+  current="$(current_home_component)"
+  if ! valid_component "$current"; then
+    echo "Could not record the current Home component." >&2
+    return 1
+  fi
+  printf '%s\n' "$current" >"$destination/current-home.txt"
+  previous_file="$(previous_home_file)"
+  cp "$previous_file" "$destination/previous-home.txt"
+  write_original_state_device_info "$destination"
+  display_size="$(adb_shell wm size | tr -d '\r')"
+  display_density="$(adb_shell wm density | tr -d '\r')"
+  [[ -n "$display_size" && -n "$display_density" ]] || {
+    echo "Could not read the current display configuration." >&2
+    return 1
+  }
+  printf '%s\n' "$display_size" >"$destination/display-size.txt"
+  printf '%s\n' "$display_density" >"$destination/display-density.txt"
+  write_original_state_settings "$destination"
+  write_original_state_packages "$destination"
+  write_original_state_manifest "$destination"
+}
+
+validate_original_state() {
+  local source="$1"
+  local work manifest_entries expected_files actual_files relative expected actual
+  if [[ ! -d "$source" || -L "$source" ]]; then
+    echo "Original-state baseline directory not found or unsafe: ${source:-<missing path>}" >&2
+    return 1
+  fi
+  work="$(mktemp -d "${TMPDIR:-/tmp}/saro-original-state-verify.XXXXXX")"
+  manifest_entries="$work/manifest-entries.tsv"
+  expected_files="$work/expected-files"
+  actual_files="$work/actual-files"
+  if [[ ! -f "$source/manifest.tsv" || -L "$source/manifest.tsv" ]] ||
+    ! awk -F '\t' '
+      NR == 1 {
+        if (NF != 2 || $1 != "path" || $2 != "sha256") exit 20
+        next
+      }
+      {
+        if (NF != 2 || length($2) != 64 || $2 !~ /^[0-9a-f]+$/) exit 21
+        if ($1 != "current-home.txt" && $1 != "previous-home.txt" &&
+            $1 != "device-info.txt" && $1 != "display-size.txt" &&
+            $1 != "display-density.txt" && $1 != "settings.tsv" &&
+            $1 != "third-party-packages.tsv") exit 22
+        if (seen[$1]++) exit 23
+        print
+        count++
+      }
+      END {if (count != 7) exit 24}
+    ' "$source/manifest.tsv" >"$manifest_entries"; then
+    find "$work" -depth -delete
+    echo "Original-state manifest is malformed, duplicated, or incomplete." >&2
+    return 1
+  fi
+  printf '%s\n' manifest.tsv current-home.txt previous-home.txt device-info.txt \
+    display-size.txt display-density.txt settings.tsv third-party-packages.tsv |
+    LC_ALL=C sort >"$expected_files"
+  : >"$actual_files"
+  while IFS= read -r -d '' relative; do
+    printf '%s\n' "${relative#"$source"/}" >>"$actual_files"
+  done < <(find "$source" -mindepth 1 -maxdepth 1 -type f -print0)
+  LC_ALL=C sort -o "$actual_files" "$actual_files"
+  if find "$source" -mindepth 1 -maxdepth 1 ! -type f -print -quit | grep -q . ||
+    ! cmp -s "$expected_files" "$actual_files"; then
+    find "$work" -depth -delete
+    echo "Original-state baseline contains missing, extra, or non-regular entries." >&2
+    return 1
+  fi
+  while IFS=$'\t' read -r relative expected; do
+    actual="$(sha256_file "$source/$relative")"
+    if [[ "$actual" != "$expected" ]]; then
+      find "$work" -depth -delete
+      echo "Original-state baseline hash mismatch: $relative" >&2
+      return 1
+    fi
+  done <"$manifest_entries"
+  if ! valid_component "$(tr -d '\r\n' <"$source/current-home.txt")" ||
+    ! safe_previous_home_component "$(tr -d '\r\n' <"$source/previous-home.txt")" ||
+    ! awk -F '=' '
+      NF < 2 || $1 == "" || $2 == "" {exit 20}
+      {if (seen[$1]++) exit 21; present[$1]=1; value[$1]=$2}
+      END {
+        if (NR != 10 || !present["adb_serial"] || !present["model"] ||
+            !present["product"] || !present["device"] ||
+            !present["android_release"] || !present["api"] ||
+            !present["abi_list"] || !present["security_patch"] ||
+            !present["fingerprint"] || !present["saro_installed"]) exit 22
+        if (value["saro_installed"] != "true" &&
+            value["saro_installed"] != "false") exit 23
+      }
+    ' "$source/device-info.txt" ||
+    ! awk -F '\t' '
+      NR == 1 {
+        if (NF != 3 || $1 != "namespace" || $2 != "key" || $3 != "value") exit 20
+        next
+      }
+      {
+        id=$1 "/" $2
+        if (NF != 3 || seen[id]++) exit 21
+        if (id != "secure/enabled_accessibility_services" &&
+            id != "secure/accessibility_enabled" &&
+            id != "global/force_resizable_activities" &&
+            id != "global/enable_freeform_support") exit 22
+        count++
+      }
+      END {if (count != 4) exit 23}
+    ' "$source/settings.tsv" ||
+    ! awk -F '\t' '
+      NR == 1 {
+        if (NF != 3 || $1 != "package" || $2 != "version_code" ||
+            $3 != "version_name") exit 20
+        next
+      }
+      {
+        if (NF != 3 || $1 !~ /^[A-Za-z0-9_]+([.][A-Za-z0-9_]+)+$/ ||
+            $2 !~ /^[0-9]+$/ || $3 == "" || seen[$1]++) exit 21
+      }
+    ' "$source/third-party-packages.tsv"; then
+    find "$work" -depth -delete
+    echo "Original-state baseline content is malformed." >&2
+    return 1
+  fi
+  find "$work" -depth -delete
+}
+
+capture_original_state() {
+  require_device
+  local destination="${1:-}"
+  local parent base stage stage_status
+  if [[ -z "$destination" ]]; then
+    echo "capture-original-state requires a private destination directory." >&2
+    return 1
+  fi
+  while [[ "$destination" != "/" && "$destination" == */ ]]; do
+    destination="${destination%/}"
+  done
+  parent="$(dirname "$destination")"
+  base="$(basename "$destination")"
+  if [[ -z "$base" || "$base" == "." || "$base" == ".." || "$destination" == "/" ||
+    -e "$destination" || -L "$destination" ]]; then
+    echo "Original-state destination must be a new, safe directory: $destination" >&2
+    return 1
+  fi
+  mkdir -p "$parent"
+  stage="$(mktemp -d "$parent/.${base}.tmp.XXXXXX")"
+  set +e
+  (
+    set -e
+    create_original_state_contents "$stage"
+    validate_original_state "$stage"
+  )
+  stage_status=$?
+  set -e
+  if [[ "$stage_status" != "0" ]]; then
+    cleanup_backup_stage "$stage" "$parent" "$base"
+    echo "Original-state capture failed; no partial baseline was published." >&2
+    return "$stage_status"
+  fi
+  if [[ -e "$destination" ]] || ! mv "$stage" "$destination"; then
+    cleanup_backup_stage "$stage" "$parent" "$base"
+    echo "Could not publish the completed original-state baseline." >&2
+    return 1
+  fi
+  echo "Read-only original-state baseline created at $destination"
+  if grep -q '^saro_installed=true$' "$destination/device-info.txt"; then
+    echo "WARNING: SARO was already installed; this is not a pristine pre-install baseline." >&2
+  fi
+  echo "This is not a firmware image and contains no protected app data. Store it privately."
+}
+
+verify_original_state() {
+  local source="${1:-}"
+  validate_original_state "$source"
+  echo "Original-state baseline verified offline: $source"
+}
+
+validate_top_level_manifest() {
+  local source="$1"
+  local validated="$2"
+  local manifest="$source/manifest.tsv"
+  local relative expected actual
+  if [[ ! -f "$manifest" || -L "$manifest" ]]; then
+    echo "Backup must contain a regular top-level manifest.tsv." >&2
+    return 1
+  fi
+  if [[ -e "$source/saro-setup.json" && -e "$source/peloton-setup.json" ]]; then
+    echo "Backup contains both neutral and legacy configuration files." >&2
+    return 1
+  fi
+  if ! awk -F '\t' '
+    NR == 1 {
+      if (NF != 2 || $1 != "path" || $2 != "sha256") exit 20
+      next
+    }
+    {
+      if (NF != 2 || $1 == "" || length($2) != 64 || $2 !~ /^[0-9a-f]+$/) exit 21
+      if ($1 != "ride-starter.apk" && $1 != "saro-setup.json" &&
+          $1 != "peloton-setup.json" &&
+          $1 != "device-info.txt" && $1 != "previous-home.txt" &&
+          $1 != "apks/manifest.tsv" && $1 != "obb/manifest.tsv") exit 22
+      if (seen[$1]++) exit 23
+      present[$1] = 1
+      print $1 "\t" $2
+      count++
+    }
+    END {
+      configCount = present["saro-setup.json"] + present["peloton-setup.json"]
+      if (!present["ride-starter.apk"] || configCount != 1 ||
+          !present["device-info.txt"] || count < 3) exit 24
+    }
+  ' "$manifest" >"$validated"; then
+    echo "Top-level recovery manifest is malformed, duplicated, header-only, or incomplete." >&2
+    return 1
+  fi
+
+  while IFS=$'\t' read -r relative expected; do
+    if [[ ! -f "$source/$relative" || -L "$source/$relative" ]]; then
+      echo "Recovery file is missing or not a regular file: $relative" >&2
+      return 1
+    fi
+    actual="$(sha256_file "$source/$relative")"
+    if [[ "$actual" != "$expected" ]]; then
+      echo "Recovery file hash mismatch: $relative" >&2
+      return 1
+    fi
+  done <"$validated"
+
+  if [[ -d "$source/apks" ]] && ! awk -F '\t' '$1 == "apks/manifest.tsv" {found=1} END {exit !found}' "$validated"; then
+    echo "The APK directory is not covered by the top-level manifest." >&2
+    return 1
+  fi
+  if [[ ! -d "$source/apks" ]] && awk -F '\t' '$1 == "apks/manifest.tsv" {found=1} END {exit !found}' "$validated"; then
+    echo "The top-level manifest lists an APK archive that is absent." >&2
+    return 1
+  fi
+  if [[ -d "$source/obb" ]] && ! awk -F '\t' '$1 == "obb/manifest.tsv" {found=1} END {exit !found}' "$validated"; then
+    echo "The expansion-file directory is not covered by the top-level manifest." >&2
+    return 1
+  fi
+  if [[ ! -d "$source/obb" ]] && awk -F '\t' '$1 == "obb/manifest.tsv" {found=1} END {exit !found}' "$validated"; then
+    echo "The top-level manifest lists expansion files that are absent." >&2
+    return 1
+  fi
+}
+
+validate_expansion_archive() {
+  local source="$1"
+  local apk_manifest="$2"
+  local manifest="$source/manifest.tsv"
+  local package version_code relative expected_bytes expected_hash actual_bytes actual_hash
+
+  if [[ ! -f "$manifest" || -L "$manifest" || ! -f "$apk_manifest" ]]; then
+    echo "Expansion files require regular OBB and APK manifests." >&2
+    return 1
+  fi
+  if ! awk -F '\t' '
+    NR == 1 {
+      if (NF != 5 || $1 != "package" || $2 != "version_code" ||
+          $3 != "obb" || $4 != "bytes" || $5 != "sha256") exit 20
+      next
+    }
+    {
+      if (NF != 5 || $1 !~ /^[A-Za-z0-9_]+([.][A-Za-z0-9_]+)+$/ ||
+          $2 !~ /^[0-9]+$/ || $4 !~ /^[0-9]+$/ || $4 == 0 ||
+          length($5) != 64 || $5 !~ /^[0-9a-f]+$/) exit 21
+      main = $1 "/main." $2 "." $1 ".obb"
+      patch = $1 "/patch." $2 "." $1 ".obb"
+      if ($3 != main && $3 != patch) exit 22
+      if (seen[$3]++) exit 23
+      count++
+    }
+    END {if (count == 0) exit 24}
+  ' "$manifest"; then
+    echo "Expansion-file manifest is malformed, duplicated, header-only, or unsafe." >&2
+    return 1
+  fi
+
+  while IFS=$'\t' read -r package version_code relative expected_bytes expected_hash; do
+    [[ "$package" != "package" ]] || continue
+    if ! awk -F '\t' -v package="$package" -v version="$version_code" \
+      'NR > 1 && $1 == package && $2 == version {found=1} END {exit !found}' "$apk_manifest"; then
+      echo "Expansion file has no matching APK package/version: $package $version_code" >&2
+      return 1
+    fi
+    if [[ ! -f "$source/$relative" || -L "$source/$relative" ]]; then
+      echo "Expansion file is missing or not regular: $relative" >&2
+      return 1
+    fi
+    actual_bytes="$(wc -c <"$source/$relative" | tr -d ' ')"
+    actual_hash="$(sha256_file "$source/$relative")"
+    if [[ "$actual_bytes" != "$expected_bytes" || "$actual_hash" != "$expected_hash" ]]; then
+      echo "Expansion-file size or hash mismatch: $relative" >&2
+      return 1
+    fi
+  done <"$manifest"
+}
+
+validate_backup_bijection() {
+  local source="$1"
+  local top_entries="$2"
+  local expected="$3"
+  local actual="$4"
+  local bad_types="$5"
+  local file relative
+
+  printf 'manifest.tsv\n' >"$expected"
+  cut -f1 "$top_entries" >>"$expected"
+  if [[ -f "$source/apks/manifest.tsv" ]]; then
+    awk -F '\t' 'NR > 1 {print "apks/" $4}' "$source/apks/manifest.tsv" >>"$expected"
+  fi
+  if [[ -f "$source/obb/manifest.tsv" ]]; then
+    awk -F '\t' 'NR > 1 {print "obb/" $3}' "$source/obb/manifest.tsv" >>"$expected"
+  fi
+  LC_ALL=C sort -u "$expected" -o "$expected"
+
+  : >"$actual"
+  : >"$bad_types"
+  while IFS= read -r -d '' file; do
+    relative="${file#"$source"/}"
+    if [[ "$relative" == *$'\n'* || "$relative" == *$'\t'* ]]; then
+      printf 'unsafe-name\n' >>"$bad_types"
+    else
+      printf '%s\n' "$relative" >>"$actual"
+    fi
+  done < <(find "$source" -mindepth 1 -type f -print0)
+  while IFS= read -r -d '' file; do
+    printf '%s\n' "${file#"$source"/}" >>"$bad_types"
+  done < <(find "$source" -mindepth 1 ! -type d ! -type f -print0)
+  if [[ -s "$bad_types" ]]; then
+    echo "Recovery bundle contains symlinks, special files, or unsafe names." >&2
+    return 1
+  fi
+  LC_ALL=C sort -u "$actual" -o "$actual"
+  if ! cmp -s "$expected" "$actual"; then
+    echo "Recovery manifest/file bijection failed. Missing or extra files:" >&2
+    diff -u "$expected" "$actual" >&2 || true
+    return 1
+  fi
+}
+
+validate_device_info_file() {
+  local file="$1"
+  if ! awk -F '=' '
+    NF < 2 || $1 == "" {exit 20}
+    seen[$1]++ {exit 21}
+    {present[$1] = 1}
+    END {
+      if (!present["model"] || !present["product"] || !present["api"] ||
+          !present["abi_list"]) exit 22
+    }
+  ' "$file" >/dev/null; then
+    echo "device-info.txt is malformed, duplicated, or incomplete." >&2
+    return 1
+  fi
+}
+
+device_info_value() {
+  local file="$1"
+  local key="$2"
+  awk -F '=' -v key="$key" '$1 == key {sub(/^[^=]*=/, ""); print; exit}' "$file"
+}
+
+preflight_device_compatibility() {
+  local info="$1"
+  local allow_mismatch="$2"
+  local mismatch=0 key expected actual property
+  if ! validate_device_info_file "$info"; then
+    return 1
+  fi
+  for key in model product api abi_list; do
+    case "$key" in
+      model) property="ro.product.model" ;;
+      product) property="ro.product.name" ;;
+      api) property="ro.build.version.sdk" ;;
+      abi_list) property="ro.product.cpu.abilist" ;;
+    esac
+    expected="$(device_info_value "$info" "$key")"
+    actual="$(adb_shell getprop "$property" | tr -d '\r')"
+    if [[ "$expected" != "$actual" ]]; then
+      echo "Device mismatch for $key: backup='$expected', connected='$actual'" >&2
+      mismatch=1
+    fi
+  done
+  if [[ "$mismatch" == "1" && "$allow_mismatch" != "1" ]]; then
+    echo "Restore refused before installation. Re-run with --allow-device-mismatch only after reviewing all differences." >&2
+    return 1
+  fi
+  if [[ "$mismatch" == "1" ]]; then
+    echo "WARNING: continuing despite explicit device compatibility mismatch override." >&2
+  fi
+}
+
+validate_helper_apk() {
+  local apk="$1"
+  local sdk_root="${ANDROID_SDK_ROOT:-$SCRIPT_DIR/../tools/android-sdk}"
+  local build_tools="${BUILD_TOOLS_VERSION:-35.0.0}"
+  local aapt="$sdk_root/build-tools/$build_tools/aapt"
+  local apksigner="$sdk_root/build-tools/$build_tools/apksigner"
+  local java_home="${JAVA_HOME:-$SCRIPT_DIR/../tools/jdk17/Contents/Home}"
+  local badging package
+  if [[ ! -x "$aapt" || ! -x "$apksigner" ]]; then
+    echo "Android aapt and apksigner are required to preflight the helper APK." >&2
+    return 1
+  fi
+  if ! JAVA_HOME="$java_home" "$apksigner" verify --verbose --print-certs "$apk" >/dev/null; then
+    echo "Recovery helper signature verification failed." >&2
+    return 1
+  fi
+  badging="$("$aapt" dump badging "$apk" 2>&1 || true)"
+  package="$(sed -n "s/^package: name='\([^']*\)'.*/\1/p" <<<"$badging")"
+  if [[ "$package" != "$HELPER_PACKAGE" ]]; then
+    echo "Recovery helper package mismatch: expected $HELPER_PACKAGE, measured ${package:-<none>}" >&2
+    return 1
+  fi
+}
+
+preflight_restore_archive() {
+  local source="$1"
+  local work="$2"
+  local previous_home
+  if ! validate_top_level_manifest "$source" "$work/top-entries.tsv"; then
+    return 1
+  fi
+  if ! validate_helper_apk "$source/ride-starter.apk"; then
+    return 1
+  fi
+  if [[ -f "$source/previous-home.txt" ]]; then
+    previous_home="$(tr -d '\r\n' <"$source/previous-home.txt")"
+    if [[ "$(wc -l <"$source/previous-home.txt" | tr -d ' ')" != "1" ]] ||
+      ! safe_previous_home_component "$previous_home"; then
+      echo "The backed-up previous Home component is malformed or unsafe." >&2
+      return 1
+    fi
+  fi
+  if [[ -d "$source/apks" ]]; then
+    if [[ ! -x "$APK_AUDIT_TOOL" ]]; then
+      echo "APK audit tool is missing or not executable: $APK_AUDIT_TOOL" >&2
+      return 1
+    fi
+    if awk -F '\t' -v helper="$HELPER_PACKAGE" 'NR > 1 && $1 == helper {found=1} END {exit !found}' \
+      "$source/apks/manifest.tsv"; then
+      echo "SARO must not be duplicated inside the third-party APK archive." >&2
+      return 1
+    fi
+    if ! "$APK_AUDIT_TOOL" "$source/apks" "$work/apk-audit.tsv" >/dev/null; then
+      return 1
+    fi
+  fi
+  if [[ -d "$source/obb" ]] &&
+    ! validate_expansion_archive "$source/obb" "$source/apks/manifest.tsv"; then
+    return 1
+  fi
+  if ! validate_backup_bijection "$source" "$work/top-entries.tsv" \
+    "$work/expected-files" "$work/actual-files" "$work/bad-types"; then
+    return 1
+  fi
+}
+
+verify_backup() {
+  local source="${1:-}"
+  local work
+  if [[ -z "$source" || ! -d "$source" ]]; then
+    echo "Backup directory not found: ${source:-<missing path>}" >&2
+    return 1
+  fi
+  source="$(cd "$source" && pwd)"
+  work="$(mktemp -d "${TMPDIR:-/tmp}/saro-backup-verify.XXXXXX")"
+  if ! preflight_restore_archive "$source" "$work" ||
+    ! validate_device_info_file "$source/device-info.txt"; then
+    find "$work" -depth -delete
+    return 1
+  fi
+  find "$work" -depth -delete
+  echo "Recovery backup verified without installing anything: $source"
+}
+
+journal_append() {
+  local journal="$1"
+  local backup_hash="$2"
+  local step="$3"
+  local status="$4"
+  local step_hash="$5"
+  printf '{"schema":1,"time":"%s","backup":"%s","serial":"%s","step":"%s","status":"%s","hash":"%s"}\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$backup_hash" "$ANDROID_SERIAL" \
+    "$step" "$status" "$step_hash" >>"$journal"
+}
+
+journal_has_success() {
+  local journal="$1"
+  local step="$2"
+  local step_hash="$3"
+  [[ -f "$journal" ]] || return 1
+  awk -v step="\"step\":\"$step\"" -v status='"status":"success"' \
+    -v hash="\"hash\":\"$step_hash\"" '
+      index($0, step) && index($0, status) && index($0, hash) {found=1}
+      END {exit !found}
+  ' "$journal"
+}
+
+installed_package_matches_hashes() {
+  local package="$1"
+  local expected_hashes="$2"
+  local work_prefix="$3"
+  local line remote hash
+  if ! adb_shell pm path "$package" 2>/dev/null | tr -d '\r' >"$work_prefix.paths" ||
+    [[ ! -s "$work_prefix.paths" ]]; then
+    return 1
+  fi
+  if ! awk '
+    !/^package:\// || !/[.]apk$/ || index($0, "\t") {exit 1}
+    {count++}
+    END {if (count == 0) exit 1}
+  ' "$work_prefix.paths"; then
+    return 1
+  fi
+  : >"$work_prefix.actual-hashes"
+  while IFS= read -r line; do
+    remote="${line#package:}"
+    hash="$(adb_shell sha256sum "$remote" 2>/dev/null | awk '{print $1}' | tr -d '\r')"
+    if [[ ! "$hash" =~ ^[0-9a-f]{64}$ ]]; then
+      return 1
+    fi
+    printf '%s\n' "$hash" >>"$work_prefix.actual-hashes"
+  done <"$work_prefix.paths"
+  LC_ALL=C sort -o "$work_prefix.actual-hashes" "$work_prefix.actual-hashes"
+  LC_ALL=C sort -o "$work_prefix.expected-hashes" "$expected_hashes"
+  cmp -s "$work_prefix.expected-hashes" "$work_prefix.actual-hashes"
+}
+
+installed_package_version_code() {
+  local package="$1"
+  local version_code
+  version_code="$(adb_shell dumpsys package "$package" 2>/dev/null |
+    sed -n 's/^[[:space:]]*versionCode=\([0-9][0-9]*\).*/\1/p' | head -1 |
+    tr -d '\r')" || return 1
+  [[ "$version_code" =~ ^[0-9]+$ ]] || return 1
+  printf '%s\n' "$version_code"
+}
+
+remote_file_matches() {
+  local remote="$1"
+  local expected_bytes="$2"
+  local expected_hash="$3"
+  local actual_bytes actual_hash
+  actual_bytes="$(adb_shell stat -c %s "$remote" 2>/dev/null | tr -d '\r')" || return 1
+  [[ "$actual_bytes" == "$expected_bytes" ]] || return 1
+  actual_hash="$(adb_shell sha256sum "$remote" 2>/dev/null | awk '{print $1}' | tr -d '\r')" ||
+    return 1
+  [[ "$actual_hash" == "$expected_hash" ]]
+}
+
+checkpoint_owned_obb_set_matches() {
+  local apk_manifest="$1"
+  local obb_manifest="$2"
+  local work_prefix="$3"
+  local remote package
+
+  awk -F '\t' 'NR > 1 && !seen[$1]++ {print $1}' "$apk_manifest" |
+    LC_ALL=C sort -u >"$work_prefix.packages"
+  : >"$work_prefix.expected"
+  if [[ -f "$obb_manifest" ]]; then
+    awk -F '\t' 'NR > 1 {
+      filename=$3
+      sub(/^.*\//, "", filename)
+      print "/sdcard/Android/obb/" $1 "/" filename
+    }' "$obb_manifest" >"$work_prefix.expected"
+  fi
+  LC_ALL=C sort -u -o "$work_prefix.expected" "$work_prefix.expected"
+  : >"$work_prefix.actual"
+  if ! adb_shell find /sdcard/Android/obb -type f -name '*.obb' |
+    tr -d '\r' >"$work_prefix.reported"; then
+    return 1
+  fi
+  while IFS= read -r remote; do
+    [[ -n "$remote" ]] || continue
+    if [[ ! "$remote" =~ ^/sdcard/Android/obb/([A-Za-z0-9_]+([.][A-Za-z0-9_]+)+)/([^/]+[.]obb)$ ]]; then
+      echo "ADB reported an unsafe expansion-file path: $remote" >&2
+      return 1
+    fi
+    package="${BASH_REMATCH[1]}"
+    if grep -Fxq "$package" "$work_prefix.packages"; then
+      printf '%s\n' "$remote" >>"$work_prefix.actual"
+    fi
+  done <"$work_prefix.reported"
+  LC_ALL=C sort -u -o "$work_prefix.actual" "$work_prefix.actual"
+  cmp -s "$work_prefix.expected" "$work_prefix.actual"
+}
+
+device_available_kb() {
+  adb_shell df -k /sdcard 2>/dev/null | awk '
+    NR > 1 && $(NF - 2) ~ /^[0-9]+$/ {print $(NF - 2); exit}
+  ' | tr -d '\r'
+}
+
+ensure_expansion_capacity() {
+  local pending_bytes="$1"
+  local label="$2"
+  local available_kb required_kb
+  available_kb="$(device_available_kb)"
+  if [[ ! "$available_kb" =~ ^[0-9]+$ ]]; then
+    echo "Could not determine free device storage before $label." >&2
+    return 1
+  fi
+  # Leave 128 MiB free so a successful transfer does not exhaust shared storage.
+  required_kb=$(((pending_bytes + 1023) / 1024 + 131072))
+  if [[ "$available_kb" -lt "$required_kb" ]]; then
+    echo "$label needs ${required_kb} KiB free (including safety margin); device reports ${available_kb} KiB." >&2
+    return 1
+  fi
+}
+
+preflight_expansion_capacity() {
+  local archive="$1"
+  local work="$2"
+  local package version_code relative expected_bytes expected_hash filename remote temporary
+  local pending_bytes=0
+  : >"$work/obb-pending.tsv"
+  [[ -d "$archive" ]] || return 0
+
+  while IFS=$'\t' read -r package version_code relative expected_bytes expected_hash; do
+    [[ "$package" != "package" ]] || continue
+    filename="${relative##*/}"
+    remote="/sdcard/Android/obb/$package/$filename"
+    temporary="$remote.saro-part"
+    if ! adb_shell rm -f "$temporary"; then
+      echo "Could not remove stale expansion staging file: $temporary" >&2
+      return 1
+    fi
+    if remote_file_matches "$remote" "$expected_bytes" "$expected_hash"; then
+      echo "Expansion file already matches on device: $filename"
+      continue
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\n' \
+      "$package" "$version_code" "$relative" "$expected_bytes" "$expected_hash" \
+      >>"$work/obb-pending.tsv"
+    pending_bytes=$((pending_bytes + expected_bytes))
+  done <"$archive/manifest.tsv"
+
+  [[ "$pending_bytes" -gt 0 ]] || return 0
+  ensure_expansion_capacity "$pending_bytes" "Expansion-file restore"
+}
+
+restore_apk_archive() {
+  local archive="$1"
+  local journal="$2"
+  local backup_hash="$3"
+  local work="$4"
+  local package relative step_hash version_code installed_version
+  local apk_files install_flags
+  [[ -d "$archive" ]] || return 0
+  awk -F '\t' 'NR > 1 && !seen[$1]++ {print $1}' "$archive/manifest.tsv" >"$work/packages"
+  while IFS= read -r package; do
+    awk -F '\t' -v package="$package" 'NR > 1 && $1 == package {print $0}' \
+      "$archive/manifest.tsv" >"$work/package-rows"
+    step_hash="$(sha256_file "$work/package-rows")"
+    version_code="$(awk -F '\t' 'NR == 1 {print $2}' "$work/package-rows")"
+    awk -F '\t' '{print $5}' "$work/package-rows" >"$work/$package.expected-hashes"
+    if journal_has_success "$journal" "apk:$package" "$step_hash" &&
+      installed_package_matches_hashes "$package" "$work/$package.expected-hashes" \
+        "$work/$package.installed"; then
+      echo "Restore journal: verified completed package $package ($version_code)"
+      continue
+    fi
+    apk_files=()
+    while IFS=$'\t' read -r _ _ _ relative _; do
+      apk_files+=("$archive/$relative")
+    done <"$work/package-rows"
+    journal_append "$journal" "$backup_hash" "apk:$package" "started" "$step_hash"
+    install_flags=(-r)
+    installed_version="$(installed_package_version_code "$package" || true)"
+    if [[ "$installed_version" =~ ^[0-9]+$ ]] &&
+      ((installed_version > version_code)); then
+      install_flags+=(-d)
+      echo "Restoring exact older version for $package ($installed_version -> $version_code)"
+    fi
+    if adb_cmd install-multiple "${install_flags[@]}" "${apk_files[@]}"; then
+      journal_append "$journal" "$backup_hash" "apk:$package" "success" "$step_hash"
+    else
+      journal_append "$journal" "$backup_hash" "apk:$package" "failed" "$step_hash"
+      return 1
+    fi
+  done <"$work/packages"
+}
+
+restore_expansion_archive() {
+  local archive="$1"
+  local journal="$2"
+  local backup_hash="$3"
+  local package _ relative expected_bytes expected_hash filename remote_dir remote temporary
+  local step
+  local work="$4"
+  [[ -d "$archive" ]] || return 0
+
+  while IFS=$'\t' read -r package _ relative expected_bytes expected_hash; do
+    filename="${relative##*/}"
+    remote_dir="/sdcard/Android/obb/$package"
+    remote="$remote_dir/$filename"
+    temporary="$remote.saro-part"
+    step="obb:$package:$filename"
+    if remote_file_matches "$remote" "$expected_bytes" "$expected_hash"; then
+      echo "Verified expansion file already present: $filename"
+      continue
+    fi
+    journal_append "$journal" "$backup_hash" "$step" "started" "$expected_hash"
+    if ! adb_shell mkdir -p "$remote_dir" ||
+      ! adb_shell rm -f "$temporary"; then
+      journal_append "$journal" "$backup_hash" "$step" "failed" "$expected_hash"
+      return 1
+    fi
+    if ! ensure_expansion_capacity "$expected_bytes" \
+      "Expansion file $filename" ||
+      ! adb_cmd push "$archive/$relative" "$temporary" </dev/null >/dev/null; then
+      adb_shell rm -f "$temporary" >/dev/null 2>&1 || true
+      journal_append "$journal" "$backup_hash" "$step" "failed" "$expected_hash"
+      return 1
+    fi
+    if ! remote_file_matches "$temporary" "$expected_bytes" "$expected_hash"; then
+      echo "Expansion-file verification failed before publish: $relative" >&2
+      adb_shell rm -f "$temporary" >/dev/null 2>&1 || true
+      journal_append "$journal" "$backup_hash" "$step" "failed" "$expected_hash"
+      return 1
+    fi
+    if ! adb_shell mv -f "$temporary" "$remote" ||
+      ! remote_file_matches "$remote" "$expected_bytes" "$expected_hash"; then
+      echo "Could not atomically publish transferred expansion file: $relative" >&2
+      adb_shell rm -f "$temporary" >/dev/null 2>&1 || true
+      journal_append "$journal" "$backup_hash" "$step" "failed" "$expected_hash"
+      return 1
+    fi
+    journal_append "$journal" "$backup_hash" "$step" "success" "$expected_hash"
+  done <"$work/obb-pending.tsv"
+}
+
+enable_helper_accessibility() {
+  local enabled_services filtered
+  if ! enabled_services="$(adb_shell settings get secure enabled_accessibility_services | tr -d '\r')"; then
+    echo "Could not read enabled accessibility services." >&2
+    return 1
+  fi
+  # Recovery always returns to the narrow original-app service. Preserve other
+  # vendors' services but explicitly remove SARO's optional provider remote.
+  filtered="$(printf '%s\n' "$enabled_services" | tr ':' '\n' |
+    awk -v tv="$HELPER_TV_ACCESSIBILITY" '
+      $0 != "" && $0 != "null" && $0 != tv {
+        if (result != "") result = result ":"
+        result = result $0
+      }
+      END {print result}
+    ')"
+  enabled_services="$filtered"
+  case ":$enabled_services:" in
+    *":$HELPER_ACCESSIBILITY:"*) ;;
+    :null:|::) enabled_services="$HELPER_ACCESSIBILITY" ;;
+    *) enabled_services="$enabled_services:$HELPER_ACCESSIBILITY" ;;
+  esac
+  if ! adb_shell settings put secure enabled_accessibility_services "$enabled_services"; then
+    return 1
+  fi
+  if ! adb_shell settings put secure accessibility_enabled 1; then
+    return 1
+  fi
+}
+
+verify_restored_state() {
+  local source="$1"
+  local work="$2"
+  local config_file="$3"
+  local package helper_hash obb_package obb_version obb_relative obb_bytes obb_hash
+  local obb_remote
+
+  if [[ -d "$source/apks" ]]; then
+    while IFS= read -r package; do
+      [[ -n "$package" ]] || continue
+      awk -F '\t' -v package="$package" 'NR > 1 && $1 == package {print $5}' \
+        "$source/apks/manifest.tsv" >"$work/$package.post-restore-hashes"
+      installed_package_matches_hashes "$package" \
+        "$work/$package.post-restore-hashes" "$work/$package.post-restore-installed" || {
+        echo "Postcondition failed for restored package: $package" >&2
+        return 1
+      }
+    done < <(awk -F '\t' 'NR > 1 && !seen[$1]++ {print $1}' \
+      "$source/apks/manifest.tsv")
+  fi
+
+  helper_hash="$(sha256_file "$source/ride-starter.apk")"
+  printf '%s\n' "$helper_hash" >"$work/helper.post-restore-hashes"
+  installed_package_matches_hashes "$HELPER_PACKAGE" \
+    "$work/helper.post-restore-hashes" "$work/helper.post-restore-installed" || {
+    echo "Postcondition failed for the restored SARO helper." >&2
+    return 1
+  }
+
+  if [[ -f "$source/obb/manifest.tsv" ]]; then
+    while IFS=$'\t' read -r obb_package obb_version obb_relative obb_bytes obb_hash; do
+      [[ "$obb_package" != "package" ]] || continue
+      obb_remote="/sdcard/Android/obb/$obb_package/${obb_relative##*/}"
+      remote_file_matches "$obb_remote" "$obb_bytes" "$obb_hash" || {
+        echo "Postcondition failed for restored expansion file: $obb_relative" >&2
+        return 1
+      }
+    done <"$source/obb/manifest.tsv"
+  fi
+
+  export_config "$work/post-restore-config.json" >/dev/null || {
+    echo "Postcondition failed: SARO configuration could not be exported." >&2
+    return 1
+  }
+  cmp -s "$config_file" "$work/post-restore-config.json" || {
+    echo "Postcondition failed: restored SARO configuration differs." >&2
+    return 1
+  }
+  [[ "$(current_home_component)" == "$HELPER_COMPONENT" ]] || {
+    echo "Postcondition failed: SARO is not the current Home." >&2
+    return 1
+  }
+  helper_accessibility_state_is_safe || {
+    echo "Postcondition failed: SARO ride accessibility is missing or optional TV Remote is enabled." >&2
+    return 1
+  }
+  if ! window_overrides_are_reset; then
+    echo "Postcondition failed: display or legacy window overrides differ from the tested state." >&2
+    return 1
+  fi
+}
+
+helper_accessibility_state_is_safe() {
+  local enabled_services accessibility_enabled
+  enabled_services="$(adb_shell settings get secure enabled_accessibility_services 2>/dev/null |
+    tr -d '\r')" || return 1
+  accessibility_enabled="$(adb_shell settings get secure accessibility_enabled 2>/dev/null |
+    tr -d '\r')" || return 1
+  [[ "$accessibility_enabled" == "1" ]] || return 1
+  case ":$enabled_services:" in
+    *":$HELPER_ACCESSIBILITY:"*) ;;
+    *) return 1 ;;
+  esac
+  case ":$enabled_services:" in
+    *":$HELPER_TV_ACCESSIBILITY:"*) return 1 ;;
+  esac
+}
+
+prepare_restore_home_rollback() {
+  local source="$1"
+  local state_file backup_home recorded_home
+  state_file="$(previous_home_file)"
+  if [[ -s "$source/previous-home.txt" ]]; then
+    backup_home="$(tr -d '\r\n' <"$source/previous-home.txt")"
+    if ! valid_previous_home_component "$backup_home"; then
+      echo "Backed-up Home component is not a current safe Home candidate: $backup_home" >&2
+      return 1
+    fi
+    if [[ -s "$state_file" ]]; then
+      recorded_home="$(tr -d '\r\n' <"$state_file")"
+      if ! valid_previous_home_component "$recorded_home"; then
+        echo "Existing host Home rollback record is invalid: ${recorded_home:-<empty>}" >&2
+        return 1
+      fi
+      if [[ "$recorded_home" != "$backup_home" ]]; then
+        echo "Host and checkpoint Home rollback records disagree." >&2
+        echo "  host:       $recorded_home" >&2
+        echo "  checkpoint: $backup_home" >&2
+        return 1
+      fi
+    else
+      write_previous_home "$backup_home"
+    fi
+    return 0
+  fi
+
+  # Historical bundles may omit this file. Resolve a rollback target before
+  # any package, setting, or expansion-file mutation is attempted.
+  record_previous_home
+}
+
+audit_live() {
+  require_device
+  local source="${1:-}"
+  local work config_file package expected_version actual_version helper_hash
+  local current_home expected_home recorded_home available_kb drift=0
+  local obb_package obb_version obb_relative obb_bytes obb_hash obb_remote
+  if [[ -z "$source" || ! -d "$source" ]]; then
+    echo "Backup directory not found: ${source:-<missing path>}" >&2
+    return 1
+  fi
+  source="$(cd "$source" && pwd)"
+  work="$(mktemp -d "${TMPDIR:-/tmp}/saro-live-audit.XXXXXX")"
+  if ! preflight_restore_archive "$source" "$work" ||
+    ! preflight_device_compatibility "$source/device-info.txt" 0; then
+    find "$work" -depth -delete
+    return 1
+  fi
+  if [[ ! -f "$source/apks/manifest.tsv" ]]; then
+    echo "Live audit requires a recovery checkpoint created with --with-apks." >&2
+    find "$work" -depth -delete
+    return 1
+  fi
+
+  if [[ -f "$source/saro-setup.json" && ! -e "$source/peloton-setup.json" ]]; then
+    config_file="$source/saro-setup.json"
+  elif [[ -f "$source/peloton-setup.json" && ! -e "$source/saro-setup.json" ]]; then
+    config_file="$source/peloton-setup.json"
+  else
+    echo "DRIFT: backup does not contain exactly one recognized configuration file." >&2
+    find "$work" -depth -delete
+    return 1
+  fi
+
+  awk -F '\t' 'NR > 1 && !seen[$1]++ {print $1}' \
+    "$source/apks/manifest.tsv" | LC_ALL=C sort >"$work/expected-packages"
+  adb_shell pm list packages -3 | tr -d '\r' | sed 's/^package://' |
+    awk -v helper="$HELPER_PACKAGE" \
+      -v vendor='^com[.]pelo''ton[.]|^com[.]onepelo''ton[.]' '
+      $0 != helper && $0 !~ vendor {print}
+    ' | LC_ALL=C sort -u >"$work/live-packages"
+  if ! cmp -s "$work/expected-packages" "$work/live-packages"; then
+    echo "DRIFT: installed third-party package set differs from the checkpoint:" >&2
+    diff -u "$work/expected-packages" "$work/live-packages" >&2 || true
+    drift=$((drift + 1))
+  fi
+
+  while IFS= read -r package; do
+    [[ -n "$package" ]] || continue
+    awk -F '\t' -v package="$package" 'NR > 1 && $1 == package {print $5}' \
+      "$source/apks/manifest.tsv" >"$work/$package.expected-hashes"
+    if ! installed_package_matches_hashes "$package" \
+      "$work/$package.expected-hashes" "$work/$package.installed"; then
+      echo "DRIFT: installed APK hash set differs for $package." >&2
+      drift=$((drift + 1))
+    fi
+    expected_version="$(awk -F '\t' -v package="$package" \
+      'NR > 1 && $1 == package {print $2; exit}' "$source/apks/manifest.tsv")"
+    actual_version="$(installed_package_version_code "$package" || true)"
+    if [[ "$actual_version" != "$expected_version" ]]; then
+      echo "DRIFT: $package versionCode is ${actual_version:-unavailable}; expected $expected_version." >&2
+      drift=$((drift + 1))
+    fi
+  done <"$work/expected-packages"
+
+  if ! checkpoint_owned_obb_set_matches "$source/apks/manifest.tsv" \
+    "$source/obb/manifest.tsv" "$work/checkpoint-obbs"; then
+    echo "DRIFT: checkpoint-owned expansion-file paths differ:" >&2
+    diff -u "$work/checkpoint-obbs.expected" "$work/checkpoint-obbs.actual" >&2 || true
+    drift=$((drift + 1))
+  fi
+  if [[ -f "$source/obb/manifest.tsv" ]]; then
+    while IFS=$'\t' read -r obb_package obb_version obb_relative obb_bytes obb_hash; do
+      [[ "$obb_package" != "package" ]] || continue
+      obb_remote="/sdcard/Android/obb/$obb_package/${obb_relative##*/}"
+      if ! remote_file_matches "$obb_remote" "$obb_bytes" "$obb_hash"; then
+        echo "DRIFT: expansion file differs or is missing: $obb_relative" >&2
+        drift=$((drift + 1))
+      fi
+    done <"$source/obb/manifest.tsv"
+  fi
+
+  helper_hash="$(sha256_file "$source/ride-starter.apk")"
+  printf '%s\n' "$helper_hash" >"$work/helper.expected-hashes"
+  if ! installed_package_matches_hashes "$HELPER_PACKAGE" \
+    "$work/helper.expected-hashes" "$work/helper.installed"; then
+    echo "DRIFT: installed SARO helper does not match the checkpoint." >&2
+    drift=$((drift + 1))
+  fi
+
+  if ! export_config "$work/live-config.json" >/dev/null; then
+    echo "DRIFT: live SARO configuration could not be exported." >&2
+    drift=$((drift + 1))
+  elif ! cmp -s "$config_file" "$work/live-config.json"; then
+    echo "DRIFT: live SARO configuration differs from the checkpoint." >&2
+    drift=$((drift + 1))
+  fi
+
+  current_home="$(current_home_component)"
+  if [[ "$current_home" != "$HELPER_COMPONENT" ]]; then
+    echo "DRIFT: current Home is ${current_home:-unresolved}; expected $HELPER_COMPONENT." >&2
+    drift=$((drift + 1))
+  fi
+
+  if ! helper_accessibility_state_is_safe; then
+    echo "DRIFT: SARO ride accessibility is missing or optional TV Remote is enabled." >&2
+    drift=$((drift + 1))
+  fi
+
+  if [[ ! -s "$source/previous-home.txt" ]]; then
+    echo "DRIFT: checkpoint has no original Home rollback record." >&2
+    drift=$((drift + 1))
+  else
+    expected_home="$(tr -d '\r\n' <"$source/previous-home.txt")"
+    if ! valid_previous_home_component "$expected_home"; then
+      echo "DRIFT: checkpoint original Home is not a current safe Home candidate." >&2
+      drift=$((drift + 1))
+    fi
+    if [[ ! -s "$(previous_home_file)" ]]; then
+      echo "DRIFT: host has no original Home rollback record for this device." >&2
+      drift=$((drift + 1))
+    else
+      recorded_home="$(tr -d '\r\n' <"$(previous_home_file)")"
+      if ! valid_previous_home_component "$recorded_home"; then
+        echo "DRIFT: host original Home is not a current safe Home candidate." >&2
+        drift=$((drift + 1))
+      fi
+      if [[ "$recorded_home" != "$expected_home" ]]; then
+        echo "DRIFT: host and checkpoint original Home records differ." >&2
+        drift=$((drift + 1))
+      fi
+    fi
+  fi
+
+  if ! window_overrides_are_reset; then
+    echo "DRIFT: display or legacy window overrides differ from the tested state." >&2
+    drift=$((drift + 1))
+  fi
+
+  available_kb="$(device_available_kb)"
+  if [[ "$available_kb" =~ ^[0-9]+$ ]]; then
+    echo "Device free storage: $available_kb KiB"
+    if [[ "$available_kb" -lt 786432 ]]; then
+      echo "WARNING: device free storage is below the 768 MiB maintenance threshold." >&2
+    fi
+  else
+    echo "WARNING: device free storage could not be measured." >&2
+  fi
+
+  find "$work" -depth -delete
+  if [[ "$drift" != "0" ]]; then
+    echo "Live audit found $drift drift condition(s)." >&2
+    return 1
+  fi
+  echo "Live tablet matches the exact recovery checkpoint."
+}
+
+restore_backup() {
+  require_device
+  local source="${1:-}"
+  local option="${2:-}"
+  local allow_mismatch=0 work backup_hash serial_suffix journal helper_hash config_hash
+  local config_file
+  if [[ "$option" == "--allow-device-mismatch" ]]; then
+    allow_mismatch=1
+  elif [[ -n "$option" ]]; then
+    echo "Unknown restore option: $option" >&2
+    return 1
+  fi
+  if [[ -z "$source" || ! -d "$source" ]]; then
+    echo "Backup directory not found: ${source:-<missing path>}" >&2
+    return 1
+  fi
+  source="$(cd "$source" && pwd)"
+  work="$(mktemp -d "${TMPDIR:-/tmp}/saro-restore-preflight.XXXXXX")"
+  if ! preflight_restore_archive "$source" "$work"; then
+    find "$work" -depth -delete
+    return 1
+  fi
+  if ! preflight_device_compatibility "$source/device-info.txt" "$allow_mismatch"; then
+    find "$work" -depth -delete
+    return 1
+  fi
+  if ! prepare_restore_home_rollback "$source"; then
+    find "$work" -depth -delete
+    echo "Restore refused before modifying the device because Home rollback is not ready." >&2
+    return 1
+  fi
+  if ! preflight_expansion_capacity "$source/obb" "$work"; then
+    find "$work" -depth -delete
+    return 1
+  fi
+
+  if [[ -f "$source/saro-setup.json" && ! -e "$source/peloton-setup.json" ]]; then
+    config_file="$source/saro-setup.json"
+  elif [[ -f "$source/peloton-setup.json" && ! -e "$source/saro-setup.json" ]]; then
+    config_file="$source/peloton-setup.json"
+  else
+    find "$work" -depth -delete
+    echo "Backup must contain exactly one recognized SARO configuration file." >&2
+    return 1
+  fi
+
+  backup_hash="$(sha256_file "$source/manifest.tsv")"
+  serial_suffix="$(device_state_suffix)"
+  mkdir -p "$STATE_DIR/restore-journals"
+  journal="$STATE_DIR/restore-journals/$backup_hash-$serial_suffix.jsonl"
+  if [[ ! -f "$journal" ]]; then
+    journal_append "$journal" "$backup_hash" "restore" "started" "$backup_hash"
+  fi
+
+  if ! restore_apk_archive "$source/apks" "$journal" "$backup_hash" "$work"; then
+    find "$work" -depth -delete
+    echo "Restore stopped. Re-run the same command to resume from $journal" >&2
+    return 1
+  fi
+  if ! restore_expansion_archive "$source/obb" "$journal" "$backup_hash" "$work"; then
+    find "$work" -depth -delete
+    echo "Restore stopped while transferring expansion files. Re-run the same command to resume from $journal" >&2
+    return 1
+  fi
+
+  helper_hash="$(sha256_file "$source/ride-starter.apk")"
+  printf '%s\n' "$helper_hash" >"$work/helper.expected-hashes"
+  if ! journal_has_success "$journal" "helper" "$helper_hash" ||
+    ! installed_package_matches_hashes "$HELPER_PACKAGE" \
+      "$work/helper.expected-hashes" "$work/helper.installed"; then
+    journal_append "$journal" "$backup_hash" "helper" "started" "$helper_hash"
+    if adb_cmd install -r "$source/ride-starter.apk"; then
+      journal_append "$journal" "$backup_hash" "helper" "success" "$helper_hash"
+    else
+      journal_append "$journal" "$backup_hash" "helper" "failed" "$helper_hash"
+      find "$work" -depth -delete
+      return 1
+    fi
+  fi
+
+  if ! journal_has_success "$journal" "accessibility" "$helper_hash" ||
+    ! helper_accessibility_state_is_safe; then
+    journal_append "$journal" "$backup_hash" "accessibility" "started" "$helper_hash"
+    if enable_helper_accessibility; then
+      journal_append "$journal" "$backup_hash" "accessibility" "success" "$helper_hash"
+    else
+      journal_append "$journal" "$backup_hash" "accessibility" "failed" "$helper_hash"
+      find "$work" -depth -delete
+      return 1
+    fi
+  fi
+
+  config_hash="$(sha256_file "$config_file")"
+  journal_append "$journal" "$backup_hash" "config" "started" "$config_hash"
+  if import_config "$config_file"; then
+    journal_append "$journal" "$backup_hash" "config" "success" "$config_hash"
+  else
+    journal_append "$journal" "$backup_hash" "config" "failed" "$config_hash"
+    find "$work" -depth -delete
+    return 1
+  fi
+
+  journal_append "$journal" "$backup_hash" "display" "started" "$helper_hash"
+  if reset_window_overrides; then
+    journal_append "$journal" "$backup_hash" "display" "success" "$helper_hash"
+  else
+    journal_append "$journal" "$backup_hash" "display" "failed" "$helper_hash"
+    find "$work" -depth -delete
+    return 1
+  fi
+  if ! journal_has_success "$journal" "home" "$helper_hash" ||
+    [[ "$(current_home_component)" != "$HELPER_COMPONENT" ]]; then
+    journal_append "$journal" "$backup_hash" "home" "started" "$helper_hash"
+    if assign_saro_home; then
+      journal_append "$journal" "$backup_hash" "home" "success" "$helper_hash"
+    else
+      journal_append "$journal" "$backup_hash" "home" "failed" "$helper_hash"
+      find "$work" -depth -delete
+      return 1
+    fi
+  else
+    if ! health_check_helper; then
+      find "$work" -depth -delete
+      return 1
+    fi
+  fi
+  if ! verify_restored_state "$source" "$work" "$config_file"; then
+    journal_append "$journal" "$backup_hash" "restore" "failed" "$backup_hash"
+    find "$work" -depth -delete
+    echo "Restore operations completed, but final state verification failed." >&2
+    return 1
+  fi
+  journal_append "$journal" "$backup_hash" "restore" "success" "$backup_hash"
+  find "$work" -depth -delete
+  echo "Backup restored. Journal: $journal"
+  echo "Missing catalog apps can be installed from Manage Apps."
+}
+
+cmd="${1:-}"
+case "$cmd" in
+  status)
+    require_adb
+    adb_server_cmd devices -l
+    require_device
+    adb_shell am stack list
+    ;;
+  just-ride)
+    start_just_ride
+    ;;
+  browser)
+    shift
+    open_browser "${1:-https://www.google.com}"
+    ;;
+  youtube)
+    open_youtube
+    ;;
+  split-browser)
+    shift
+    split_browser "${1:-https://www.google.com}"
+    ;;
+  split-youtube)
+    split_youtube
+    ;;
+  overlay-browser)
+    shift
+    overlay_browser "${1:-https://www.google.com}"
+    ;;
+  overlay-youtube)
+    overlay_youtube
+    ;;
+  netflix)
+    open_netflix
+    ;;
+  split-netflix)
+    split_netflix
+    ;;
+  overlay-netflix)
+    overlay_netflix
+    ;;
+  disney)
+    open_disney
+    ;;
+  split-disney)
+    split_disney
+    ;;
+  overlay-disney)
+    overlay_disney
+    ;;
+  max)
+    open_max
+    ;;
+  split-max)
+    split_max
+    ;;
+  overlay-max)
+    overlay_max
+    ;;
+  hbo|hbo-max)
+    open_max
+    ;;
+  split-hbo|split-hbo-max)
+    split_max
+    ;;
+  overlay-hbo|overlay-hbo-max)
+    overlay_max
+    ;;
+  hulu)
+    open_hulu
+    ;;
+  split-hulu)
+    split_hulu
+    ;;
+  overlay-hulu)
+    overlay_hulu
+    ;;
+  apple-tv|appletv)
+    open_apple_tv
+    ;;
+  split-apple-tv|split-appletv)
+    split_apple_tv
+    ;;
+  overlay-apple-tv|overlay-appletv)
+    overlay_apple_tv
+    ;;
+  overlay-current)
+    restore_ride_overlay
+    ;;
+  ride-controls)
+    ride_controls_fullscreen
+    ;;
+  restore-overlay)
+    shift
+    restore_ride_overlay "${1:-}"
+    ;;
+  dismiss-banner)
+    dismiss_subscription_banner
+    ;;
+  start-window-agent)
+    echo "start-window-agent is quarantined; use research-start-window-agent with the explicit capability and risk controls shown in --help." >&2
+    exit 1
+    ;;
+  research-start-window-agent)
+    shift
+    start_window_agent "${1:-}"
+    ;;
+  window-agent-status)
+    window_agent_status
+    ;;
+  stop-window-agent)
+    stop_window_agent
+    ;;
+  deploy-helper)
+    deploy_helper
+    ;;
+  bootstrap-tablet)
+    bootstrap_tablet
+    ;;
+  capture-original-state)
+    shift
+    capture_original_state "${1:-}"
+    ;;
+  verify-original-state)
+    shift
+    verify_original_state "${1:-}"
+    ;;
+  record-home-rollback)
+    record_home_rollback
+    ;;
+  restore-home)
+    restore_home
+    ;;
+  safe-uninstall|uninstall-saro-safely)
+    safe_uninstall
+    ;;
+  export-config)
+    shift
+    export_config "${1:-}"
+    ;;
+  import-config)
+    shift
+    import_config "${1:-}"
+    ;;
+  backup)
+    shift
+    create_backup "${1:-}" "${2:-}"
+    ;;
+  verify-backup)
+    shift
+    verify_backup "${1:-}"
+    ;;
+  audit-live)
+    shift
+    audit_live "${1:-}"
+    ;;
+  restore-backup)
+    shift
+    restore_backup "${1:-}" "${2:-}"
+    ;;
+  close-overlay)
+    close_just_ride_overlay
+    ;;
+  reset-apps)
+    reset_apps
+    ;;
+  check)
+    quick_check
+    ;;
+  login-netflix)
+    login_netflix
+    ;;
+  login-disney)
+    login_disney
+    ;;
+  login-max)
+    login_max
+    ;;
+  login-hbo|login-hbo-max)
+    login_max
+    ;;
+  login-hulu)
+    login_hulu
+    ;;
+  login-apple-tv|login-appletv)
+    login_apple_tv
+    ;;
+  screenshot)
+    take_screenshot
+    ;;
+  ""|-h|--help|help)
+    usage
+    ;;
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac
