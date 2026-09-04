@@ -46,10 +46,12 @@ On 2026-09-04, the measured configuration above passed exact-model preflight,
 atomic original-state capture and offline verification, helper installation,
 Accessibility enablement, Home assignment, and exact post-bootstrap/configured
 checkpoint verification. Owner-pedaled cadence, watts, and resistance all
-updated through the Affernet callback.
+updated through the Affernet callback. The privately signed patched app-store
+build also installed and launched from its native launcher activity.
 
-Media overlays, games, optional TV Remote, BLE bridging, cold-reboot recovery,
-and `safe-uninstall` remain untested on this model.
+App download and installation, media overlays, games, optional TV Remote, BLE
+bridging, cold-reboot recovery, and `safe-uninstall` remain untested on this
+model.
 
 ## Removal
 
