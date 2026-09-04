@@ -7,8 +7,12 @@ This repository contains hardware-specific integration work. Treat device compat
 | Tablet model | Product/device | Android | API | ABI | Platform | Implementation |
 | --- | --- | --- | --- | --- | --- | --- |
 | `PLTN-RB1VO-2` | `RB1VO` | 11 | 30 | `arm64-v8a` only | MediaTek `mt8173` | [`device-setup/`](device-setup/) |
+| `PLTN-RB1VO` | `RB1VO` | 11 | 30 | `arm64-v8a` only | MediaTek `mt8173` | [`devices/pltn-rb1vo/`](devices/pltn-rb1vo/) |
 
-These values were read from the connected tablet with `getprop`. The tested build fingerprint is `Peloton/RB1VO/RB1VO:11/RO.250111.A/43:user/release-keys` and its reported security patch level is `2022-10-05`.
+These values were read from connected tablets with `getprop`. Both tested
+models report build fingerprint
+`Peloton/RB1VO/RB1VO:11/RO.250111.A/43:user/release-keys` and security patch
+level `2022-10-05`.
 
 ## Device Change Safety
 

@@ -1421,7 +1421,8 @@ record_previous_home() {
     recorded="$(tr -d '\r\n' <"$state_file")"
     if valid_previous_home_component "$recorded"; then
       if [[ "$current" == "$recorded" || "$current" == "$HELPER_COMPONENT" ||
-        "$current" == "com.android.settings/.FallbackHome" ]]; then
+        "$current" == "com.android.settings/.FallbackHome" ||
+        "$current" == "android/com.android.internal.app.ResolverActivity" ]]; then
         return 0
       fi
       echo "Current Home $current conflicts with recorded original Home $recorded." >&2
@@ -1993,7 +1994,7 @@ write_original_state_settings() {
   local namespace key value
   printf 'namespace\tkey\tvalue\n' >"$destination/settings.tsv"
   while IFS=$'\t' read -r namespace key; do
-    value="$(adb_shell settings get "$namespace" "$key" | tr -d '\r')"
+    value="$(adb_shell settings get "$namespace" "$key" </dev/null | tr -d '\r')"
     if [[ "$value" == *$'\n'* || "$value" == *$'\t'* ]]; then
       echo "Android returned an unsafe multi-line setting for $namespace/$key" >&2
       return 1

@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SHARED_CONTROL="$SCRIPT_DIR/../../device-setup/saro-control"
+ADB="${ADB:-adb}"
+
+EXPECTED_MODEL="PLTN-RB1VO"
+EXPECTED_PRODUCT="RB1VO"
+EXPECTED_DEVICE="RB1VO"
+EXPECTED_ANDROID="11"
+EXPECTED_API="30"
+EXPECTED_ABI="arm64-v8a"
+EXPECTED_FINGERPRINT="Peloton/RB1VO/RB1VO:11/RO.250111.A/43:user/release-keys"
+EXPECTED_SIZE="Physical size: 1920x1080"
+EXPECTED_DENSITY="Physical density: 240"
+EXPECTED_BIKE_APP_VERSION="2.8.3404"
+EXPECTED_AFFERNET_VERSION="3.1.1"
+
+adb_server() {
+  "$ADB" "$@"
+}
+
+adb_device() {
+  "$ADB" -s "$ANDROID_SERIAL" "$@"
+}
+
+property() {
+  adb_device shell getprop "$1" | tr -d '\r'
+}
+
+package_version() {
+  adb_device shell dumpsys package "$1" </dev/null |
+    sed -n 's/^[[:space:]]*versionName=//p' |
+    head -1 |
+    tr -d '\r'
+}
+
+require_value() {
+  local label="$1"
+  local actual="$2"
+  local expected="$3"
+  if [[ "$actual" != "$expected" ]]; then
+    echo "Unsupported PLTN-RB1VO $label: expected '$expected', measured '${actual:-<empty>}'." >&2
+    return 1
+  fi
+}
+
+select_device() {
+  local devices_file count state
+  devices_file="$(mktemp "${TMPDIR:-/tmp}/saro-rb1vo-devices.XXXXXX")"
+  if ! adb_server devices -l >"$devices_file"; then
+    rm -f "$devices_file"
+    echo "Could not query ADB devices." >&2
+    return 1
+  fi
+  if [[ -n "${ANDROID_SERIAL:-}" ]]; then
+    state="$(awk -v serial="$ANDROID_SERIAL" '$1 == serial {print $2; exit}' "$devices_file")"
+    [[ "$state" == "device" ]] || {
+      echo "ANDROID_SERIAL '$ANDROID_SERIAL' is not connected and authorized." >&2
+      rm -f "$devices_file"
+      return 1
+    }
+  else
+    count="$(awk 'NR > 1 && $2 == "device" {count++} END {print count + 0}' "$devices_file")"
+    [[ "$count" == "1" ]] || {
+      echo "Expected exactly one connected and authorized ADB device; found $count." >&2
+      cat "$devices_file" >&2
+      rm -f "$devices_file"
+      return 1
+    }
+    ANDROID_SERIAL="$(awk 'NR > 1 && $2 == "device" {print $1; exit}' "$devices_file")"
+    export ANDROID_SERIAL
+  fi
+  [[ "$ANDROID_SERIAL" =~ ^[A-Za-z0-9._:-]+$ ]] || {
+    echo "Refusing unsafe ADB serial value: $ANDROID_SERIAL" >&2
+    rm -f "$devices_file"
+    return 1
+  }
+  rm -f "$devices_file"
+}
+
+preflight() {
+  command -v "$ADB" >/dev/null 2>&1 || {
+    echo "ADB not found on PATH: $ADB" >&2
+    return 1
+  }
+  select_device
+
+  require_value "model" "$(property ro.product.model)" "$EXPECTED_MODEL"
+  require_value "product" "$(property ro.product.name)" "$EXPECTED_PRODUCT"
+  require_value "device" "$(property ro.product.device)" "$EXPECTED_DEVICE"
+  require_value "Android release" "$(property ro.build.version.release)" "$EXPECTED_ANDROID"
+  require_value "API level" "$(property ro.build.version.sdk)" "$EXPECTED_API"
+  require_value "ABI list" "$(property ro.product.cpu.abilist)" "$EXPECTED_ABI"
+  require_value "build fingerprint" "$(property ro.build.fingerprint)" "$EXPECTED_FINGERPRINT"
+  require_value "display size" "$(adb_device shell wm size | tr -d '\r')" "$EXPECTED_SIZE"
+  require_value "display density" "$(adb_device shell wm density | tr -d '\r')" "$EXPECTED_DENSITY"
+  require_value "bike app version" \
+    "$(package_version com.peloton.activity)" "$EXPECTED_BIKE_APP_VERSION"
+  require_value "Affernet sensor service version" \
+    "$(package_version com.onepeloton.affernetservice)" "$EXPECTED_AFFERNET_VERSION"
+
+  local home
+  home="$(adb_device shell cmd package resolve-activity --brief \
+    -a android.intent.action.MAIN -c android.intent.category.HOME |
+    tr -d '\r' |
+    awk '/^[A-Za-z0-9_.]+\/[A-Za-z0-9_.$]+$/ {component=$0} END {print component}')"
+  case "$home" in
+    com.peloton.launcher/.LauncherActivity|com.pelotonhack.ridestarter/.MainActivity|\
+android/com.android.internal.app.ResolverActivity) ;;
+    *)
+      echo "Unsupported PLTN-RB1VO Home component: ${home:-<unresolved>}." >&2
+      return 1
+      ;;
+  esac
+  echo "PLTN-RB1VO compatibility preflight passed for $ANDROID_SERIAL."
+}
+
+case "${1:-}" in
+  preflight)
+    preflight
+    ;;
+  verify-original-state|verify-backup|help|-h|--help)
+    exec "$SHARED_CONTROL" "$@"
+    ;;
+  *)
+    preflight
+    exec "$SHARED_CONTROL" "$@"
+    ;;
+esac
