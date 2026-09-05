@@ -127,6 +127,7 @@ run_control() {
   local state="$1"
   shift
   env ADB="$FAKE_ADB" ANDROID_SERIAL=FAKE123 FAKE_ADB_STATE_DIR="$state" \
+    FAKE_ADB_DRAIN_SETTINGS_STDIN=1 \
     SARO_CONTROL_STATE_DIR="$state/host-state" ANDROID_SDK_ROOT="$SDK" \
     BUILD_TOOLS_VERSION=35.0.0 CONFIG_STATUS_SLEEP=0 CONFIG_STATUS_ATTEMPTS=2 \
     APK_AUDIT_TOOL="$AUDIT_APKS" "$CONTROL" "$@"
@@ -281,6 +282,17 @@ run_control "$INFER_HOME_STATE" record-home-rollback >/dev/null
 [[ "$(cat "$INFER_HOME_STATE/host-state/previous-home-FAKE123")" == \
   "com.peloton.activity/.MainActivity" ]] || fail "original Home inference recorded the wrong component"
 pass "original Home is inferred when SARO is already Home and one safe candidate exists"
+
+CHOOSER_HOME_STATE="$(new_adb_state chooser-home)"
+mkdir -p "$CHOOSER_HOME_STATE/host-state"
+printf 'com.peloton.activity/.MainActivity\n' \
+  >"$CHOOSER_HOME_STATE/host-state/previous-home-FAKE123"
+printf 'android/com.android.internal.app.ResolverActivity\n' >"$CHOOSER_HOME_STATE/home"
+run_control "$CHOOSER_HOME_STATE" record-home-rollback >/dev/null
+[[ "$(cat "$CHOOSER_HOME_STATE/host-state/previous-home-FAKE123")" == \
+  "com.peloton.activity/.MainActivity" ]] ||
+  fail "launcher chooser replaced the validated original Home"
+pass "transient launcher chooser preserves an existing valid Home rollback"
 
 AMBIGUOUS_HOME_STATE="$(new_adb_state ambiguous-home)"
 cp "$CANONICAL/ride-starter.apk" "$AMBIGUOUS_HOME_STATE/helper.apk"

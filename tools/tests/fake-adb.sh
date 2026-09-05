@@ -12,6 +12,11 @@ if [[ "${1:-}" == "-s" ]]; then
   [[ "$serial" == "${FAKE_ADB_SERIAL:-FAKE123}" ]] || exit 1
 fi
 
+if [[ "${FAKE_ADB_DRAIN_SETTINGS_STDIN:-0}" == "1" &&
+  "${1:-}" == "shell" && "${2:-}" == "settings" && "${3:-}" == "get" ]]; then
+  cat >/dev/null
+fi
+
 cmd="${1:-}"
 shift || true
 case "$cmd" in
