@@ -4,6 +4,12 @@ Read [`ai-contributors.md`](ai-contributors.md) before changing code or a
 connected device. Read [`docs/recovery.md`](docs/recovery.md) before any ADB
 operation that can modify device state.
 
+Before building, installing, or updating Aurora Store or any streaming
+application, read
+[`docs/streaming-app-install.md`](docs/streaming-app-install.md). It defines the
+RB1VO profile choice, last-verified provider packages and versions, installation
+checks, and the required post-install checkpoint.
+
 ## Mandatory Device Safety Gate
 
 Before the first install, uninstall, package-data change, Home assignment,

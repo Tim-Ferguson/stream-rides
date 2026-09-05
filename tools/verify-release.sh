@@ -14,7 +14,8 @@ fail() {
 for required in LICENSE README.md AGENTS.md THIRD_PARTY_NOTICES.md ai-contributors.md \
   ZWIFT_HANDOFF.md docs/config-schema-v2.md docs/direct-sensor-live-test.md \
   docs/sensor-recovery-live-test.md \
-  docs/recovery.md docs/release-signing.md docs/streaming-live-test.md \
+  docs/recovery.md docs/release-signing.md docs/streaming-app-install.md \
+  docs/streaming-live-test.md \
   docs/privacy-audit.md docs/public-release.md \
   docs/tv-remote-live-test.md \
   docs/game-asset-provenance.md docs/security/package-security-audit.md \

@@ -232,6 +232,11 @@ remote-oriented controls that are less comfortable on a touchscreen.
 
 ## App Store
 
+Agents performing a fresh Aurora or streaming-provider installation must follow
+[`../docs/streaming-app-install.md`](../docs/streaming-app-install.md). It
+contains the safety gate, Aurora APK installation and signer checks, profile
+selection, and the last-verified provider package/version matrix.
+
 The tested setup uses a per-installation locally signed Aurora Store 4.8.4 compatibility build
 from pinned source and the tracked patch. The patch addresses duplicate list
 keys and profile de-duplication on this device. Use an

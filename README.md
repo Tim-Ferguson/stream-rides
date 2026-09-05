@@ -284,6 +284,8 @@ private recovery bundle rather than the public tree.
   and post-reconnect telemetry evidence.
 - `docs/streaming-live-test.md`: protected playback and in-video app-drawer
   evidence.
+- `docs/streaming-app-install.md`: agent runbook for installing the locally
+  built Aurora Store and the last-verified provider packages.
 - `context.md`, `plan.md`, and `NEXT_STEPS.md`: architecture context, roadmap,
   and engineering handoff.
 
